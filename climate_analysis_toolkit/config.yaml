@@ -1,0 +1,223 @@
+# 气候分析工具包配置文件
+# 可以通过环境变量或命令行参数覆盖这些设置
+
+# 数据路径配置
+data:
+  # 观测数据目录
+  obs_dir: "/sas12t1/ffyan/obs"
+  # 预测数据目录
+  forecast_dir: "/raid62/EC-C3S/month"
+  # 输出目录
+  output_dir: "/sas12t1/ffyan/output"
+  # 临时文件目录
+  temp_dir: "/sas12t1/ffyan/temp"
+
+# 支持的模型配置
+models:
+  CMCC-35:
+    pl: "cmcc.35"
+    sfc: "cmcc.35.sfc"
+    description: "CMCC Climate Model"
+  DWD-mon-21:
+    pl: "dwd.21"
+    sfc: "dwd.sfc.21"
+    description: "DWD Monthly Forecast System"
+  ECMWF-51-mon:
+    pl: "ecmwf.51"
+    sfc: "ecmwf.51.sfc"
+    description: "ECMWF Monthly Forecast System"
+  Meteo-France-8:
+    pl: "meteo_france.8"
+    sfc: "meteo_france.sfc.8"
+    description: "Meteo-France Monthly Forecast"
+  JMA-3-mon:
+    pl: "jma.3"
+    sfc: "jma.3.sfc"
+    description: "JMA Monthly Forecast"
+  NCEP-2:
+    pl: "ncep.2"
+    sfc: "ncep.2.sfc"
+    description: "NCEP Climate Forecast System"
+  UKMO-14:
+    pl: "ukmo.14"
+    sfc: "ukmo.sfc.14"
+    description: "UK Met Office Monthly Forecast"
+  ECCC-Canada-3:
+    pl: "eccc.3"
+    sfc: "eccc.sfc.3"
+    description: "Environment Canada Monthly Forecast"
+
+# 变量配置
+variables:
+  temp:
+    file_type: "sfc"
+    obs_names: ["t", "t2m", "temp", "temperature", "tas", "tm"]
+    fcst_names: ["t", "t2m", "temp", "temperature", "tas", "tm"]
+    unit: "K"
+    cmap: "coolwarm"
+    title: "Temperature"
+    description: "2-meter temperature"
+  prec:
+    file_type: "sfc"
+    obs_names: ["tp", "prec", "pr", "precip", "tprate", "pre"]
+    fcst_names: ["tp", "tprate", "prec", "pr", "precip", "pre"]
+    obs_conv: "multiply_86400"  # kg m-2 s-1 → mm/day
+    fcst_conv: "multiply_86400_1000"  # m s-1 → mm/day
+    unit: "mm/day"
+    cmap: "Blues"
+    title: "Precipitation"
+    description: "Total precipitation"
+
+# 时间配置
+time:
+  # 支持的提前期（月）
+  lead_times: [0, 1, 2, 3, 4, 5]
+  # 时间范围
+  date_range: ["1993-01", "2020-12"]
+  # 时间频率
+  frequency: "1MS"
+
+# 空间配置
+spatial:
+  # 默认空间边界
+  bounds:
+    lat: [15.0, 55.0]
+    lon: [70.0, 140.0]
+  # 坐标名称映射
+  coord_mapping:
+    lat: ["latitude", "lats", "ylat"]
+    lon: ["longitude", "lons", "xlon"]
+  # 插值方法
+  interpolation: "linear"
+
+# 分析参数配置
+analysis:
+  # EOF分析配置
+  eof:
+    n_modes: 6
+    standardize: true
+    min_valid_cols: 1
+    min_time_points: 1
+    debug_mode: true
+  
+  # 相关性分析配置
+  correlation:
+    min_valid_points: 3
+    significance_level: 0.05
+    method: "pearson"
+  
+  # RMSE分析配置
+  rmse:
+    high_bias_threshold: 15
+    high_rmse_threshold: 15
+    bias_threshold: 5
+  
+  # 功率谱分析配置
+  spectrum:
+    window_type: "hanning"
+    detrend: true
+    nperseg: null  # 自动计算
+    nfft: null     # 自动计算
+    regions:
+      global:
+        lat: [15, 55]
+        lon: [70, 140]
+      east_asia:
+        lat: [20, 50]
+        lon: [100, 140]
+      south_asia:
+        lat: [5, 35]
+        lon: [70, 100]
+
+# 可视化配置
+visualization:
+  # 绘图配置
+  plot:
+    figure_dpi: 300
+    savefig_dpi: 300
+    default_figsize: [12, 8]
+    font_size: 12
+    line_width: 2
+    marker_size: 6
+  
+  # 地图配置
+  map:
+    projection: "PlateCarree"
+    coastline_resolution: "50m"
+    coastline_linewidth: 1.0
+    coastline_color: "black"
+    gridline_alpha: 0.5
+    gridline_linestyle: "--"
+    country_borders_path: "/sas12t1/ffyan/boundaries/国界线.shp"
+  
+  # 颜色配置
+  colors:
+    models:
+      CMCC-35: "#1f77b4"
+      DWD-mon-21: "#ff7f0e"
+      ECMWF-51-mon: "#2ca02c"
+      Meteo-France-8: "#d62728"
+      JMA-3-mon: "#9467bd"
+      NCEP-2: "#8c564b"
+      UKMO-14: "#e377c2"
+      ECCC-Canada-3: "#7f7f7f"
+    lead_times: ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+    obs_color: "black"
+    obs_alpha: 0.7
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_mode: "w"
+  handlers: ["file", "console"]
+  log_dir: "/sas12t1/ffyan/log"
+
+# 输出配置
+output:
+  create_dirs: true
+  overwrite: false
+  compression: "gzip"
+  encoding: "utf-8"
+  formats: ["netcdf", "csv", "png", "json"]
+
+# 性能配置
+performance:
+  # 并行处理
+  parallel: true
+  n_jobs: 32
+  # 内存管理
+  chunk_size: "auto"
+  # 缓存
+  cache_results: true
+  cache_dir: "./cache"
+
+# 质量控制配置
+quality_control:
+  # 数据验证
+  validate_input: true
+  check_missing_data: true
+  # 异常值检测
+  outlier_detection: true
+  outlier_threshold: 3.0  # 标准差倍数
+  # 数据完整性
+  min_data_coverage: 0.8  # 最小数据覆盖率
+
+# 环境特定配置
+environments:
+  development:
+    debug_mode: true
+    log_level: "DEBUG"
+    cache_results: false
+  
+  production:
+    debug_mode: false
+    log_level: "WARNING"
+    cache_results: true
+    parallel: true
+  
+  testing:
+    debug_mode: true
+    log_level: "INFO"
+    cache_results: false
+    parallel: false
