@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import cartopy.io.shapereader as shpreader
 from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FixedLocator
@@ -112,7 +113,116 @@ class ClimatologyAnalyzer:
         (self.data_dir / "temp").mkdir(exist_ok=True)
         (self.data_dir / "prec").mkdir(exist_ok=True)
         
+        # 设置 boundaries 文件夹路径
+        self.boundaries_dir = Path(__file__).parent.parent / "boundaries"
+        
         logger.info("ClimatologyAnalyzer 初始化完成")
+    
+    def add_china_map_details(self, ax, data, lon, lat, levels, cmap, draw_scs=True):
+        """
+        添加中国国界线、河流和南海子图（优化版）
+        修复说明：
+        1. 使用指定的绝对路径加载两个shp文件 (中国_省1.shp, 中国_省2.shp)。
+        2. 修复了 hyd_path 变量在使用前未定义的问题。
+        """
+        # --- 1. 确定文件路径（使用指定的绝对路径） ---
+        
+        # 指定需要加载的国界线文件列表
+        bou_paths = [
+            Path("/sas12t1/ffyan/boundaries/中国_省1.shp"),
+            Path("/sas12t1/ffyan/boundaries/中国_省2.shp")
+        ]
+        
+        # 修复变量未定义错误：先定义 hyd_path
+        # 假设河流文件在 boundaries 目录下，如果不存在则设为 None
+        hyd_path = self.boundaries_dir / "河流.shp"
+        if not hyd_path.exists():
+            hyd_path = None
+        
+        # --- 2. 绘制河流（长江黄河等主要河流） ---
+        if hyd_path:
+            try:
+                reader = shpreader.Reader(str(hyd_path))
+                ax.add_geometries(reader.geometries(), ccrs.PlateCarree(),
+                                edgecolor='blue', facecolor='none', 
+                                linewidth=0.8, alpha=0.8, zorder=5)
+                logger.info(f"已加载河流: {hyd_path}")
+            except Exception as e:
+                logger.warning(f"河流加载失败: {e}，使用默认河流")
+                ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
+        else:
+            # 使用 Cartopy 自带河流
+            # logger.info("使用 Cartopy 默认河流特征")
+            ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
+        
+        # --- 3. 绘制国界线（遍历加载所有指定的shp文件） ---
+        loaded_borders = False
+        for bou_path in bou_paths:
+            if bou_path.exists():
+                try:
+                    reader = shpreader.Reader(str(bou_path))
+                    geoms = list(reader.geometries())
+                    # 加粗国界线：linewidth=1.2，zorder=100 确保在最上层
+                    ax.add_geometries(geoms, ccrs.PlateCarree(), 
+                                    edgecolor='black', facecolor='none', 
+                                    linewidth=0.6, zorder=100)
+                    logger.info(f"✓ 已加载国界线: {bou_path.name} (几何数: {len(geoms)})")
+                    loaded_borders = True
+                except Exception as e:
+                    logger.warning(f"国界线Shapefile读取失败 {bou_path}: {e}")
+            else:
+                logger.warning(f"未找到国界线文件: {bou_path}")
+        
+        if not loaded_borders:
+            # 如果没有任何文件加载成功，使用默认边界
+            logger.warning("未找到任何指定Shapefile，使用默认边界")
+            ax.add_feature(cfeature.BORDERS, linewidth=1.0, zorder=100)
+        
+        # --- 4. 绘制南海子图（完全紧贴右下角，不留空隙） ---
+        if draw_scs:
+            try:
+                # 位置参数：右边和底边完全贴边
+                # [x, y, width, height] 相对于父 ax 的坐标 (0-1)
+                scs_width = 0.33
+                scs_height = 0.35
+                sub_ax = ax.inset_axes([0.7548, 0, scs_width, scs_height], 
+                                      projection=ccrs.PlateCarree())
+                
+                # 设置白色背景，防止透视主图内容
+                sub_ax.patch.set_facecolor('white')
+                
+                # 设置南海范围（包含九段线）
+                sub_ax.set_extent([105, 125, 0, 25], crs=ccrs.PlateCarree())
+                
+                # 在子图中绘制相同的数据
+                sub_ax.contourf(lon, lat, data, transform=ccrs.PlateCarree(),
+                               cmap=cmap, levels=levels, extend='both')
+                
+                # 在子图中也绘制国界线（遍历加载所有指定的shp文件）
+                if loaded_borders:
+                    for bou_path in bou_paths:
+                        if bou_path.exists():
+                            try:
+                                reader = shpreader.Reader(str(bou_path))
+                                geoms_sub = list(reader.geometries())
+                                sub_ax.add_geometries(geoms_sub, ccrs.PlateCarree(),
+                                                    edgecolor='black', facecolor='none', 
+                                                    linewidth=1.0, zorder=100)
+                            except Exception:
+                                pass
+                
+                # 移除刻度，保留边框
+                sub_ax.tick_params(left=False, labelleft=False, 
+                                  bottom=False, labelbottom=False)
+                
+                # 设置子图边框
+                for spine in sub_ax.spines.values():
+                    spine.set_edgecolor('black')
+                    spine.set_linewidth(1.0)
+                
+                # logger.info("✓ 已添加南海子图")
+            except Exception as e:
+                logger.warning(f"南海子图绘制失败: {e}")
     
     def load_obs_data(self, var_type: str) -> Optional[xr.DataArray]:
         """加载观测数据（1度网格，不插值）"""
@@ -716,9 +826,10 @@ class ClimatologyAnalyzer:
                         logger.warning("没有有效的观测数据，使用默认降水范围")
                         clim_vmax = 10
             
-            # 设置colormap - 统一使用 coolwarm
+            # 设置colormap
             cmap_clim = 'coolwarm'
-            cmap_bias = 'coolwarm'
+            # 降水的 bias 使用反转 colormap
+            cmap_bias = 'coolwarm_r' if var_type == 'prec' else 'coolwarm'
             if len(all_bias_values) > 0:
                 all_bias_values = np.array(all_bias_values)
                 # 进一步确保没有无穷值
@@ -770,8 +881,7 @@ class ClimatologyAnalyzer:
             # ===== 第1行第1列：观测气候态 =====
             ax_obs = fig.add_subplot(gs[0, 0], projection=ccrs.PlateCarree())
             ax_obs.set_extent([70, 140, 15, 55], crs=ccrs.PlateCarree())
-            ax_obs.add_feature(cfeature.COASTLINE, linewidth=0.5)
-            ax_obs.add_feature(cfeature.BORDERS, linewidth=0.5)
+            # 基础底图
             ax_obs.add_feature(cfeature.LAND, alpha=0.1)
             ax_obs.add_feature(cfeature.OCEAN, alpha=0.1)
             gl = ax_obs.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
@@ -785,6 +895,10 @@ class ClimatologyAnalyzer:
             im_clim = ax_obs.contourf(obs_clim.lon, obs_clim.lat, obs_clim_display,
                                      transform=ccrs.PlateCarree(),
                                      cmap=cmap_clim, levels=levels, extend='both')
+            
+            # 添加中国国界线、河流和南海子图
+            self.add_china_map_details(ax_obs, obs_clim_display, obs_clim.lon, obs_clim.lat,
+                                      levels, cmap_clim, draw_scs=True)
             
             ax_obs.text(0.02, 0.98, 'Observation',
                        transform=ax_obs.transAxes, fontsize=11, fontweight='bold',
@@ -880,8 +994,7 @@ class ClimatologyAnalyzer:
                 # 空间分布图（占用grid_row行）
                 ax_spatial = fig.add_subplot(gs[grid_row, grid_col], projection=ccrs.PlateCarree())
                 ax_spatial.set_extent([70, 140, 15, 55], crs=ccrs.PlateCarree())
-                ax_spatial.add_feature(cfeature.COASTLINE, linewidth=0.5)
-                ax_spatial.add_feature(cfeature.BORDERS, linewidth=0.5)
+                # 基础底图
                 ax_spatial.add_feature(cfeature.LAND, alpha=0.1)
                 ax_spatial.add_feature(cfeature.OCEAN, alpha=0.1)
                 gl = ax_spatial.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
@@ -894,6 +1007,10 @@ class ClimatologyAnalyzer:
                 im_bias = ax_spatial.contourf(model_bias.lon, model_bias.lat, model_bias,
                                              transform=ccrs.PlateCarree(),
                                              cmap=cmap_bias, levels=bias_levels, extend='both')
+                
+                # 添加中国国界线、河流和南海子图
+                self.add_china_map_details(ax_spatial, model_bias, model_bias.lon, model_bias.lat,
+                                          bias_levels, cmap_bias, draw_scs=True)
                 
                 # 模型标签
                 label = chr(97 + i)
@@ -1059,8 +1176,8 @@ class ClimatologyAnalyzer:
                         all_bias_values.extend(bias_valid)
             
             # 计算偏差颜色范围（对称，保留所有信息）
-            # 统一使用 coolwarm
-            cmap_bias = 'coolwarm'
+            # 降水的 bias 使用反转 colormap
+            cmap_bias = 'coolwarm_r' if var_type == 'prec' else 'coolwarm'
             
             if len(all_bias_values) > 0:
                 all_bias_values = np.array(all_bias_values)
@@ -1179,8 +1296,7 @@ class ClimatologyAnalyzer:
                     ax_obs = fig.add_subplot(gs[row_obs, 0], projection=ccrs.PlateCarree())
                     # 使用数据范围设置显示区域
                     ax_obs.set_extent([lon_range[0], lon_range[1], lat_range[0], lat_range[1]], crs=ccrs.PlateCarree())
-                    ax_obs.add_feature(cfeature.COASTLINE, linewidth=0.5)
-                    ax_obs.add_feature(cfeature.BORDERS, linewidth=0.5)
+                    # 基础底图
                     ax_obs.add_feature(cfeature.LAND, alpha=0.1)
                     ax_obs.add_feature(cfeature.OCEAN, alpha=0.1)
                     
@@ -1238,6 +1354,10 @@ class ClimatologyAnalyzer:
                                             transform=ccrs.PlateCarree(),
                                             cmap=cmap_clim, levels=levels, extend='both')
                     
+                    # 添加中国国界线、河流和南海子图
+                    self.add_china_map_details(ax_obs, obs_clim_display, obs_clim.lon, obs_clim.lat,
+                                              levels, cmap_clim, draw_scs=True)
+                    
                     ax_obs.text(0.02, 0.98, 'Observation',
                                transform=ax_obs.transAxes, fontsize=18, fontweight='bold',
                                verticalalignment='top', horizontalalignment='left')
@@ -1269,8 +1389,7 @@ class ClimatologyAnalyzer:
                     ax_spatial = fig.add_subplot(gs[row_obs, col_idx + 1], projection=ccrs.PlateCarree())
                     # 使用数据范围设置显示区域
                     ax_spatial.set_extent([lon_range[0], lon_range[1], lat_range[0], lat_range[1]], crs=ccrs.PlateCarree())
-                    ax_spatial.add_feature(cfeature.COASTLINE, linewidth=0.5)
-                    ax_spatial.add_feature(cfeature.BORDERS, linewidth=0.5)
+                    # 基础底图
                     ax_spatial.add_feature(cfeature.LAND, alpha=0.1)
                     ax_spatial.add_feature(cfeature.OCEAN, alpha=0.1)
                     
@@ -1294,6 +1413,10 @@ class ClimatologyAnalyzer:
                     im_bias = ax_spatial.contourf(model_bias.lon, model_bias.lat, model_bias,
                                                  transform=ccrs.PlateCarree(),
                                                  cmap=cmap_bias, levels=bias_levels, extend='both')
+                    
+                    # 添加中国国界线、河流和南海子图
+                    self.add_china_map_details(ax_spatial, model_bias, model_bias.lon, model_bias.lat,
+                                              bias_levels, cmap_bias, draw_scs=True)
                     
                     # 模型标签
                     label = chr(97 + col_idx)
@@ -1330,8 +1453,7 @@ class ClimatologyAnalyzer:
                     ax_spatial = fig.add_subplot(gs[row_models2, col_idx], projection=ccrs.PlateCarree())
                     # 使用数据范围设置显示区域
                     ax_spatial.set_extent([lon_range[0], lon_range[1], lat_range[0], lat_range[1]], crs=ccrs.PlateCarree())
-                    ax_spatial.add_feature(cfeature.COASTLINE, linewidth=0.5)
-                    ax_spatial.add_feature(cfeature.BORDERS, linewidth=0.5)
+                    # 基础底图
                     ax_spatial.add_feature(cfeature.LAND, alpha=0.1)
                     ax_spatial.add_feature(cfeature.OCEAN, alpha=0.1)
                     
@@ -1355,6 +1477,10 @@ class ClimatologyAnalyzer:
                     im_bias = ax_spatial.contourf(model_bias.lon, model_bias.lat, model_bias,
                                                  transform=ccrs.PlateCarree(),
                                                  cmap=cmap_bias, levels=bias_levels, extend='both')
+                    
+                    # 添加中国国界线、河流和南海子图
+                    self.add_china_map_details(ax_spatial, model_bias, model_bias.lon, model_bias.lat,
+                                              bias_levels, cmap_bias, draw_scs=True)
                     
                     # 模型标签
                     label = chr(97 + col_idx + 3)  # 从d开始
