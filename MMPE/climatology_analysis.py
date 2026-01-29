@@ -145,7 +145,7 @@ class ClimatologyAnalyzer:
                 reader = shpreader.Reader(str(hyd_path))
                 ax.add_geometries(reader.geometries(), ccrs.PlateCarree(),
                                 edgecolor='blue', facecolor='none', 
-                                linewidth=0.8, alpha=0.8, zorder=5)
+                                linewidth=0.6, alpha=0.6, zorder=5)
                 logger.info(f"已加载河流: {hyd_path}")
             except Exception as e:
                 logger.warning(f"河流加载失败: {e}，使用默认河流")
@@ -155,7 +155,10 @@ class ClimatologyAnalyzer:
             # logger.info("使用 Cartopy 默认河流特征")
             ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
         
-        # --- 3. 绘制国界线（遍历加载所有指定的shp文件） ---
+        # --- 3. 绘制海岸线（使用 Cartopy） ---
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor='black', zorder=50)
+        
+        # --- 4. 绘制国界线（遍历加载所有指定的shp文件） ---
         loaded_borders = False
         for bou_path in bou_paths:
             if bou_path.exists():
@@ -178,7 +181,7 @@ class ClimatologyAnalyzer:
             logger.warning("未找到任何指定Shapefile，使用默认边界")
             ax.add_feature(cfeature.BORDERS, linewidth=1.0, zorder=100)
         
-        # --- 4. 绘制南海子图（完全紧贴右下角，不留空隙） ---
+        # --- 5. 绘制南海子图（完全紧贴右下角，不留空隙） ---
         if draw_scs:
             try:
                 # 位置参数：右边和底边完全贴边
@@ -198,6 +201,9 @@ class ClimatologyAnalyzer:
                 sub_ax.contourf(lon, lat, data, transform=ccrs.PlateCarree(),
                                cmap=cmap, levels=levels, extend='both')
                 
+                # 在子图中也绘制海岸线
+                sub_ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor='black', zorder=50)
+                
                 # 在子图中也绘制国界线（遍历加载所有指定的shp文件）
                 if loaded_borders:
                     for bou_path in bou_paths:
@@ -207,7 +213,7 @@ class ClimatologyAnalyzer:
                                 geoms_sub = list(reader.geometries())
                                 sub_ax.add_geometries(geoms_sub, ccrs.PlateCarree(),
                                                     edgecolor='black', facecolor='none', 
-                                                    linewidth=1.0, zorder=100)
+                                                    linewidth=0.6, zorder=100)
                             except Exception:
                                 pass
                 
