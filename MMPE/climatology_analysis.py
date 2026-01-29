@@ -121,28 +121,22 @@ class ClimatologyAnalyzer:
     def add_china_map_details(self, ax, data, lon, lat, levels, cmap, draw_scs=True):
         """
         添加中国国界线、河流和南海子图（优化版）
-        
-        Args:
-            ax: matplotlib axes 对象
-            data: 要绘制的数据（用于南海子图）
-            lon: 经度坐标
-            lat: 纬度坐标
-            levels: 等高线级别
-            cmap: 色标
-            draw_scs: 是否绘制南海子图
+        修复说明：
+        1. 使用指定的绝对路径加载两个shp文件 (中国_省1.shp, 中国_省2.shp)。
+        2. 修复了 hyd_path 变量在使用前未定义的问题。
         """
-        # --- 1. 确定文件路径（支持多种文件名） ---
-
-        bou_path_alt = self.boundaries_dir / "国界线.shp"
-        if bou_path_alt.exists():
-            bou_path = bou_path_alt
-            logger.info(f"使用中文文件名: {bou_path}")
-        else:
-            logger.warning(f"未找到国界线文件: {bou_path} 或 {bou_path_alt}")
-            bou_path = None
+        # --- 1. 确定文件路径（使用指定的绝对路径） ---
         
+        # 指定需要加载的国界线文件列表
+        bou_paths = [
+            Path("/sas12t1/ffyan/boundaries/中国_省1.shp"),
+            Path("/sas12t1/ffyan/boundaries/中国_省2.shp")
+        ]
+        
+        # 修复变量未定义错误：先定义 hyd_path
+        # 假设河流文件在 boundaries 目录下，如果不存在则设为 None
+        hyd_path = self.boundaries_dir / "河流.shp"
         if not hyd_path.exists():
-            # 如果标准河流文件不存在，稍后使用 Cartopy 默认河流
             hyd_path = None
         
         # --- 2. 绘制河流（长江黄河等主要河流） ---
@@ -155,28 +149,33 @@ class ClimatologyAnalyzer:
                 logger.info(f"已加载河流: {hyd_path}")
             except Exception as e:
                 logger.warning(f"河流加载失败: {e}，使用默认河流")
-                ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.8, alpha=0.6, zorder=5)
+                ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
         else:
             # 使用 Cartopy 自带河流
-            logger.info("使用 Cartopy 默认河流特征")
-            ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.8, alpha=0.6, zorder=5)
+            # logger.info("使用 Cartopy 默认河流特征")
+            ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
         
-        # --- 3. 绘制国界线（扩线效果，确保可见） ---
-        if bou_path:
-            try:
-                reader = shpreader.Reader(str(bou_path))
-                geoms = list(reader.geometries())
-                # 加粗国界线：linewidth=1.2，zorder=100 确保在最上层
-                ax.add_geometries(geoms, ccrs.PlateCarree(), 
-                                edgecolor='black', facecolor='none', 
-                                linewidth=1.2, zorder=100)
-                logger.info(f"✓ 已加载国界线: {bou_path.name}, 几何数: {len(geoms)}")
-            except Exception as e:
-                logger.warning(f"国界线Shapefile读取失败: {e}，使用默认边界")
-                ax.add_feature(cfeature.BORDERS, linewidth=1.0, zorder=100)
-        else:
-            # 如果没有找到文件，使用默认边界
-            logger.warning("未找到Shapefile，使用默认边界")
+        # --- 3. 绘制国界线（遍历加载所有指定的shp文件） ---
+        loaded_borders = False
+        for bou_path in bou_paths:
+            if bou_path.exists():
+                try:
+                    reader = shpreader.Reader(str(bou_path))
+                    geoms = list(reader.geometries())
+                    # 加粗国界线：linewidth=1.2，zorder=100 确保在最上层
+                    ax.add_geometries(geoms, ccrs.PlateCarree(), 
+                                    edgecolor='black', facecolor='none', 
+                                    linewidth=0.6, zorder=100)
+                    logger.info(f"✓ 已加载国界线: {bou_path.name} (几何数: {len(geoms)})")
+                    loaded_borders = True
+                except Exception as e:
+                    logger.warning(f"国界线Shapefile读取失败 {bou_path}: {e}")
+            else:
+                logger.warning(f"未找到国界线文件: {bou_path}")
+        
+        if not loaded_borders:
+            # 如果没有任何文件加载成功，使用默认边界
+            logger.warning("未找到任何指定Shapefile，使用默认边界")
             ax.add_feature(cfeature.BORDERS, linewidth=1.0, zorder=100)
         
         # --- 4. 绘制南海子图（完全紧贴右下角，不留空隙） ---
@@ -184,7 +183,6 @@ class ClimatologyAnalyzer:
             try:
                 # 位置参数：右边和底边完全贴边
                 # [x, y, width, height] 相对于父 ax 的坐标 (0-1)
-                # x + width = 1.0 使右边贴边，y = 0 使底边贴边
                 scs_width = 0.33
                 scs_height = 0.35
                 sub_ax = ax.inset_axes([0.7548, 0, scs_width, scs_height], 
@@ -200,17 +198,18 @@ class ClimatologyAnalyzer:
                 sub_ax.contourf(lon, lat, data, transform=ccrs.PlateCarree(),
                                cmap=cmap, levels=levels, extend='both')
                 
-                # 在子图中也绘制国界线（九段线）
-                if bou_path:
-                    try:
-                        reader = shpreader.Reader(str(bou_path))
-                        geoms_sub = list(reader.geometries())
-                        sub_ax.add_geometries(geoms_sub, ccrs.PlateCarree(),
-                                            edgecolor='black', facecolor='none', 
-                                            linewidth=1.0, zorder=100)
-                        logger.info(f"✓ 南海子图已添加国界线")
-                    except Exception as e:
-                        logger.warning(f"南海子图添加国界线失败: {e}")
+                # 在子图中也绘制国界线（遍历加载所有指定的shp文件）
+                if loaded_borders:
+                    for bou_path in bou_paths:
+                        if bou_path.exists():
+                            try:
+                                reader = shpreader.Reader(str(bou_path))
+                                geoms_sub = list(reader.geometries())
+                                sub_ax.add_geometries(geoms_sub, ccrs.PlateCarree(),
+                                                    edgecolor='black', facecolor='none', 
+                                                    linewidth=1.0, zorder=100)
+                            except Exception:
+                                pass
                 
                 # 移除刻度，保留边框
                 sub_ax.tick_params(left=False, labelleft=False, 
@@ -221,7 +220,7 @@ class ClimatologyAnalyzer:
                     spine.set_edgecolor('black')
                     spine.set_linewidth(1.0)
                 
-                logger.info("✓ 已添加南海子图")
+                # logger.info("✓ 已添加南海子图")
             except Exception as e:
                 logger.warning(f"南海子图绘制失败: {e}")
     
