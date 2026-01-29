@@ -48,6 +48,11 @@ import pandas as pd
 import scipy.stats as stats
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FixedLocator
+# === 添加 cartopy 相关导入（用于高精度地图绘制） ===
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import cartopy.io.shapereader as shpreader
+from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 from typing import Dict, List, Optional, Tuple, Union
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -160,6 +165,8 @@ class SeasonalMonthlyPearsonAnalyzer:
         # 绘图存储路径
         self.plot_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/plots/{self.var_type}")
         self.plot_dir.mkdir(parents=True, exist_ok=True)
+        # === 新增：初始化 boundaries 路径（用于高精度地图绘制） ===
+        self.boundaries_dir = Path(__file__).parent.parent / "boundaries"
        
     def get_anomalies(self, obs_data: xr.DataArray, fcst_data: xr.DataArray, leadtime: int) -> Tuple[xr.DataArray, xr.DataArray]:
         """计算逐格点月距平场"""
@@ -551,6 +558,111 @@ class SeasonalMonthlyPearsonAnalyzer:
             
         return monthly_corrs
     
+    def add_china_map_details(self, ax, data, lon, lat, levels, cmap, draw_scs=True):
+        """
+        添加中国国界线、河流、海岸线和南海子图（复用自 climatology_analysis.py）
+        
+        注意：此方法仅修改子图内部内容，不影响整体布局
+        
+        Args:
+            ax: matplotlib axes 对象（必须是 GeoAxes，即使用 projection=ccrs.PlateCarree()）
+            data: 要绘制的数据数组（用于南海子图）
+            lon: 经度坐标
+            lat: 纬度坐标
+            levels: 等高线级别
+            cmap: 色标
+            draw_scs: 是否绘制南海子图
+        """
+        # 指定需要加载的国界线文件列表
+        bou_paths = [
+            Path("/sas12t1/ffyan/boundaries/中国_省1.shp"),
+            Path("/sas12t1/ffyan/boundaries/中国_省2.shp")
+        ]
+        
+        # 河流路径
+        hyd_path = self.boundaries_dir / "河流.shp"
+        if not hyd_path.exists():
+            hyd_path = None
+        
+        # --- 1. 绘制河流 ---
+        if hyd_path:
+            try:
+                reader = shpreader.Reader(str(hyd_path))
+                ax.add_geometries(reader.geometries(), ccrs.PlateCarree(),
+                                edgecolor='blue', facecolor='none', 
+                                linewidth=0.6, alpha=0.6, zorder=5)
+            except Exception as e:
+                ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
+        else:
+            ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
+        
+        # --- 2. 绘制海岸线 ---
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor='black', zorder=50)
+        
+        # --- 3. 绘制国界线 ---
+        loaded_borders = False
+        for bou_path in bou_paths:
+            if bou_path.exists():
+                try:
+                    reader = shpreader.Reader(str(bou_path))
+                    geoms = list(reader.geometries())
+                    ax.add_geometries(geoms, ccrs.PlateCarree(), 
+                                    edgecolor='black', facecolor='none', 
+                                    linewidth=0.6, zorder=100)
+                    loaded_borders = True
+                except Exception:
+                    pass
+        
+        if not loaded_borders:
+            ax.add_feature(cfeature.BORDERS, linewidth=1.0, zorder=100)
+        
+        # --- 4. 绘制南海子图 ---
+        if draw_scs:
+            try:
+                # 位置参数：[x, y, width, height] (相对于父ax的坐标 0-1)
+                scs_width = 0.33
+                scs_height = 0.35
+                sub_ax = ax.inset_axes([0.7548, 0, scs_width, scs_height], 
+                                      projection=ccrs.PlateCarree())
+                
+                # 设置白色背景
+                sub_ax.patch.set_facecolor('white')
+                
+                # 设置南海范围
+                sub_ax.set_extent([105, 125, 0, 25], crs=ccrs.PlateCarree())
+                
+                # 在子图中绘制相同的数据
+                sub_ax.contourf(lon, lat, data, transform=ccrs.PlateCarree(),
+                               cmap=cmap, levels=levels, extend='both')
+                
+                # 在子图中也绘制海岸线
+                sub_ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor='gray', zorder=50)
+                
+                # 在子图中也绘制国界线
+                if loaded_borders:
+                    for bou_path in bou_paths:
+                        if bou_path.exists():
+                            try:
+                                reader = shpreader.Reader(str(bou_path))
+                                geoms_sub = list(reader.geometries())
+                                sub_ax.add_geometries(geoms_sub, ccrs.PlateCarree(),
+                                                    edgecolor='black', facecolor='none', 
+                                                    linewidth=0.6, zorder=100)
+                            except Exception:
+                                pass
+                
+                # 移除子图刻度，保留边框
+                sub_ax.tick_params(left=False, labelleft=False, 
+                                  bottom=False, labelbottom=False)
+                
+                # 设置子图边框
+                for spine in sub_ax.spines.values():
+                    spine.set_edgecolor('black')
+                    spine.set_linewidth(1.0)
+                    
+            except Exception as e:
+                logger.warning(f"南海子图绘制失败: {e}")
+    
     def analyze_all_models_leadtimes(self, models: List[str] = None, leadtimes: List[int] = None) -> Dict:
         """分析所有模式和提前期"""
         if models is None:
@@ -640,42 +752,188 @@ class SeasonalMonthlyPearsonAnalyzer:
     def plot_acc_spatial_maps(self, model_temporal_acc_maps: Dict[str, Dict[int, xr.Dataset]]):
         """
         绘制ACC空间分布图 (Lead 0 和 Lead 3)
-        使用统一的绘图工具 (plotting_utils)
+        
+        重写版本：添加中国国界线、河流和南海子图
+        保持原有布局不变，仅修改子图内部的地图细节
         """
         try:
-            logger.info(f"开始绘制ACC空间分布图: {self.var_type}")
+            logger.info(f"开始绘制ACC空间分布图（含中国地图细节）: {self.var_type}")
             
-            # 准备数据字典和显著性字典
-            data_dict = {}
-            significance_dict = {}
+            # 准备数据
+            plot_models = list(model_temporal_acc_maps.keys())
+            leadtimes = [0, 3]
             
-            for model, leadtime_data in model_temporal_acc_maps.items():
-                data_dict[model] = {}
-                significance_dict[model] = {}
-                for lt, acc_ds in leadtime_data.items():
-                    if lt in [0, 3]:  # 只绘制 Lead 0 和 Lead 3
-                        data_dict[model][lt] = acc_ds['temporal_acc']
-                        if 'significant' in acc_ds:
-                            significance_dict[model][lt] = acc_ds['significant']
-            
-            if not data_dict:
+            if not plot_models:
                 logger.warning("没有可用的ACC空间分布数据")
                 return
             
-            # 使用统一绘图工具
+            # 设置参数
+            lon_range = (70, 140)
+            lat_range = (15, 55)
+            vmin, vmax = -1, 1
+            cmap = 'RdBu_r'
+            n_levels = 20
+            levels = np.linspace(vmin, vmax, n_levels + 1)
+            
+            # 创建图形 - 保持与原函数相同的布局
+            fig = plt.figure(figsize=(20, 12))
+            gs = GridSpec(4, 4, figure=fig,
+                         hspace=0.25, wspace=0.15,
+                         left=0.05, right=0.92, top=0.94, bottom=0.06)
+            
+            # 计算经纬度刻度
+            lon_ticks = np.arange(75, 141, 15)
+            lat_ticks = np.arange(20, 56, 10)
+            
+            # 绘制每个leadtime
+            for lt_idx, leadtime in enumerate(leadtimes):
+                row_start = lt_idx * 2
+                
+                # 第一行：空白 + 3个模型
+                ax_blank = fig.add_subplot(gs[row_start, 0])
+                ax_blank.axis('off')
+                
+                for col_idx in range(3):
+                    if col_idx >= len(plot_models):
+                        ax = fig.add_subplot(gs[row_start, col_idx + 1])
+                        ax.axis('off')
+                        continue
+                    
+                    model = plot_models[col_idx]
+                    if leadtime not in model_temporal_acc_maps[model]:
+                        ax = fig.add_subplot(gs[row_start, col_idx + 1])
+                        ax.axis('off')
+                        continue
+                    
+                    acc_ds = model_temporal_acc_maps[model][leadtime]
+                    data = acc_ds['temporal_acc']
+                    display_name = model.replace('-mon', '').replace('mon-', '')
+                    
+                    # 创建cartopy地图
+                    ax = fig.add_subplot(gs[row_start, col_idx + 1], 
+                                       projection=ccrs.PlateCarree())
+                    ax.set_extent([lon_range[0], lon_range[1], lat_range[0], lat_range[1]], 
+                                 crs=ccrs.PlateCarree())
+                    
+                    # 添加基础特征（陆地和海洋底色）
+                    ax.add_feature(cfeature.LAND, alpha=0.1)
+                    ax.add_feature(cfeature.OCEAN, alpha=0.1)
+                    
+                    # 添加网格
+                    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
+                    gl.top_labels = False
+                    gl.right_labels = False
+                    gl.xlocator = FixedLocator(lon_ticks)
+                    gl.ylocator = FixedLocator(lat_ticks)
+                    gl.xformatter = LongitudeFormatter(number_format='.0f')
+                    gl.yformatter = LatitudeFormatter(number_format='.0f')
+                    
+                    # 绘制填色图
+                    im = ax.contourf(data.lon, data.lat, data,
+                                    transform=ccrs.PlateCarree(),
+                                    cmap=cmap, levels=levels, extend='both')
+                    
+                    # === 关键：添加中国地图细节 ===
+                    self.add_china_map_details(ax, data, data.lon, data.lat, 
+                                              levels, cmap, draw_scs=True)
+                    
+                    # 显著性打点
+                    if 'significant' in acc_ds:
+                        sig_mask = acc_ds['significant'].values
+                        if np.any(sig_mask):
+                            X, Y = np.meshgrid(data.lon, data.lat)
+                            ax.scatter(X[sig_mask][::2], Y[sig_mask][::2], 
+                                     transform=ccrs.PlateCarree(),
+                                     s=1, c='black', alpha=0.5, marker='.')
+                    
+                    # 添加标题
+                    title_text = f"({chr(97 + col_idx)}) {display_name}"
+                    ax.text(0.02, 0.96, title_text,
+                           transform=ax.transAxes, fontsize=18, fontweight='bold',
+                           verticalalignment='top', horizontalalignment='left')
+                    
+                    # 添加leadtime标签（第一个模型）
+                    if col_idx == 0:
+                        ax.text(0.98, 0.96, f'L{leadtime}',
+                               transform=ax.transAxes, fontsize=18, fontweight='bold',
+                               verticalalignment='top', horizontalalignment='right')
+                
+                # 第二行：4个模型
+                for col_idx in range(4):
+                    model_idx = col_idx + 3
+                    if model_idx >= len(plot_models):
+                        ax = fig.add_subplot(gs[row_start + 1, col_idx])
+                        ax.axis('off')
+                        continue
+                    
+                    model = plot_models[model_idx]
+                    if leadtime not in model_temporal_acc_maps[model]:
+                        ax = fig.add_subplot(gs[row_start + 1, col_idx])
+                        ax.axis('off')
+                        continue
+                    
+                    acc_ds = model_temporal_acc_maps[model][leadtime]
+                    data = acc_ds['temporal_acc']
+                    display_name = model.replace('-mon', '').replace('mon-', '')
+                    
+                    # 创建cartopy地图
+                    ax = fig.add_subplot(gs[row_start + 1, col_idx],
+                                       projection=ccrs.PlateCarree())
+                    ax.set_extent([lon_range[0], lon_range[1], lat_range[0], lat_range[1]],
+                                 crs=ccrs.PlateCarree())
+                    
+                    # 添加基础特征
+                    ax.add_feature(cfeature.LAND, alpha=0.1)
+                    ax.add_feature(cfeature.OCEAN, alpha=0.1)
+                    
+                    # 添加网格
+                    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
+                    gl.top_labels = False
+                    gl.right_labels = False
+                    gl.xlocator = FixedLocator(lon_ticks)
+                    gl.ylocator = FixedLocator(lat_ticks)
+                    gl.xformatter = LongitudeFormatter(number_format='.0f')
+                    gl.yformatter = LatitudeFormatter(number_format='.0f')
+                    
+                    # 绘制填色图
+                    im = ax.contourf(data.lon, data.lat, data,
+                                    transform=ccrs.PlateCarree(),
+                                    cmap=cmap, levels=levels, extend='both')
+                    
+                    # === 关键：添加中国地图细节 ===
+                    self.add_china_map_details(ax, data, data.lon, data.lat,
+                                              levels, cmap, draw_scs=True)
+                    
+                    # 显著性打点
+                    if 'significant' in acc_ds:
+                        sig_mask = acc_ds['significant'].values
+                        if np.any(sig_mask):
+                            X, Y = np.meshgrid(data.lon, data.lat)
+                            ax.scatter(X[sig_mask][::2], Y[sig_mask][::2],
+                                     transform=ccrs.PlateCarree(),
+                                     s=1, c='black', alpha=0.5, marker='.')
+                    
+                    # 添加标题
+                    title_text = f"({chr(97 + model_idx)}) {display_name}"
+                    ax.text(0.02, 0.96, title_text,
+                           transform=ax.transAxes, fontsize=18, fontweight='bold',
+                           verticalalignment='top', horizontalalignment='left')
+            
+            # 添加colorbar
+            cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.75])
+            cbar = fig.colorbar(im, cax=cbar_ax, orientation='vertical')
+            cbar.set_label('Temporal ACC', fontsize=14, labelpad=10)
+            cbar.ax.tick_params(labelsize=12)
+            
+            # # 添加总标题
+            # fig.suptitle(f'{self.var_type.upper()} - Temporal Anomaly Correlation Coefficient (ACC)\n'
+            #             f'Black dots: p < 0.05 (95% significance)',
+            #             fontsize=16, fontweight='bold', y=0.98)
+            
+            # 保存图像
             output_file = self.plot_dir / f"acc_spatial_maps_L0_L3_{self.var_type}.png"
-            create_spatial_distribution_figure(
-                data_dict=data_dict,
-                leadtimes=[0, 3],
-                significance_dict=significance_dict,
-                vmin=-1,
-                vmax=1,
-                cmap='RdBu_r',
-                title=f'{self.var_type.upper()} - Temporal Anomaly Correlation Coefficient (ACC)\n'
-                      f'Black dots: p < 0.05 (95% significance)',
-                colorbar_label='Temporal ACC',
-                output_file=str(output_file)
-            )
+            plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0.1)
+            plt.close()
             
             logger.info(f"ACC空间分布图已保存: {output_file}")
             
