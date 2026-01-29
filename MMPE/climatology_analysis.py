@@ -631,11 +631,22 @@ class ClimatologyAnalyzer:
             return None
     
     def calculate_bias(self, model_clim: xr.DataArray, obs_clim: xr.DataArray) -> Optional[xr.DataArray]:
-        """计算偏差（模型 - 观测），并掩膜海洋（观测为NaN的位置）"""
+        """
+        计算偏差（模型 - 观测）
+        
+        策略：将模型数据插值到观测网格，以保持观测网格的分辨率和掩膜一致性
+        观测网格中的 NaN（如海洋）会自动传播到偏差结果中
+        """
         try:
-            obs_interp = obs_clim.interp(lat=model_clim.lat, lon=model_clim.lon, method='linear')
-            bias = model_clim - obs_interp
-            bias = bias.where(~obs_interp.isnull(), np.nan)
+            # 将模型气候态插值到观测网格
+            model_interp = model_clim.interp(lat=obs_clim.lat, lon=obs_clim.lon, method='linear')
+            
+            # 计算偏差（插值后的模型 - 原始观测）
+            bias = model_interp - obs_clim
+            
+            # 观测中的 NaN 会自动传播到 bias 中（x - NaN = NaN）
+            # 无需额外掩膜操作
+            
             return bias
         except Exception as e:
             logger.error(f"计算bias失败: {e}")
@@ -2708,28 +2719,36 @@ def _process_single_model_climatology(args):
             logger.info(f"{model} 气候态范围: [{np.min(valid_clim):.2f}, {np.max(valid_clim):.2f}]")
         
         # 计算偏差（模型 - 观测）
-        # 插值观测数据到模型网格，然后逐格点计算偏差
+        # FIX: 插值模型数据到观测网格 (Model -> Obs) 以保证分辨率和掩膜一致
         try:
-            # 插值观测数据到模型网格
-            obs_interp = obs_clim.interp(lat=clim_data.lat, lon=clim_data.lon, method='linear')
+            # 1. 将模型气候态插值到观测网格
+            model_clim_interp = clim_data.interp(
+                lat=obs_clim.lat, 
+                lon=obs_clim.lon, 
+                method='linear'
+            )
             
-            # 直接逐格点计算偏差
-            bias_data = clim_data - obs_interp
+            # 2. 计算偏差 (插值后的模型 - 原始观测)
+            bias_data = model_clim_interp - obs_clim
             
-            # 排除海洋区域：将观测为NaN的位置（海洋）的bias也设为NaN
-            bias_data = bias_data.where(~obs_interp.isnull(), np.nan)
+            # 3. 观测中的 NaN (如海洋) 会自动传播到 bias_data 中 (x - NaN = NaN)
+            # 无需额外掩膜操作
             
-            # 输出偏差范围
+            # 4. 输出偏差范围
             valid_bias = bias_data.values[np.isfinite(bias_data.values)]
             if len(valid_bias) > 0:
                 logger.info(f"{model} 偏差范围: [{np.min(valid_bias):.2f}, {np.max(valid_bias):.2f}]")
+            
+            # 5. (可选) 如果希望保存的模型气候态也在观测网格上，可以更新 clim_data
+            # 这样可以确保所有图（气候态图和偏差图）使用相同的网格
+            # clim_data = model_clim_interp
             
         except Exception as e:
             logger.error(f"计算偏差失败 {model}: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            # 如果插值失败，返回全NaN的偏差数据
-            bias_data = xr.full_like(clim_data, np.nan)
+            # 如果插值失败，返回观测网格大小的全NaN偏差数据
+            bias_data = xr.full_like(obs_clim, np.nan)
         
         # 验证bias数据有效性
         n_valid_bias = np.sum(np.isfinite(bias_data.values))
