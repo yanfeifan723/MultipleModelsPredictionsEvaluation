@@ -192,6 +192,9 @@ class SeasonalMonthlyPearsonAnalyzer:
         # 空间异常相关系数存储路径
         self.spatial_acc_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/spatial_acc/{self.var_type}")
         self.spatial_acc_dir.mkdir(parents=True, exist_ok=True)
+        # 区域 Index ACC 存储路径（用于 plot_only 时加载热图/Global 折线图）
+        self.region_index_acc_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/region_index_acc/{self.var_type}")
+        self.region_index_acc_dir.mkdir(parents=True, exist_ok=True)
         # 绘图存储路径
         self.plot_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/plots/{self.var_type}")
         self.plot_dir.mkdir(parents=True, exist_ok=True)
@@ -868,13 +871,16 @@ class SeasonalMonthlyPearsonAnalyzer:
         self.save_spatial_acc_to_nc(model_spatial_acc_data)
         # 保存逐格点 Temporal ACC 空间分布(每个模式 6 个 leadtime)
         self.save_temporal_acc_maps_to_nc(model_temporal_acc_maps)
+        # 保存区域 Index ACC（供 plot_only 时加载热图与折线图）
+        self.save_region_index_acc_to_nc(region_spatial_acc_data)
         
         # 新增：绘制结果图表
         self.plot_spatial_acc_monthly_contour(model_spatial_acc_data)
-        self.plot_spatial_acc_heatmap_diverging_discrete(model_spatial_acc_data)
-        # 绘制空间ACC随leadtime折线图（使用Global区域数据）
-        self.plot_spatial_acc_leadtime_timeseries(model_spatial_acc_data, region_spatial_acc_data)
-        # 绘制ACC空间分布图 (Lead 0 和 Lead 3)
+        # 热图使用与折线图一致的数据源（Global Index ACC）
+        self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
+        # [双轨制] 绘制 Global Index ACC 折线图（仅用 region 数据）
+        self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
+        # 绘制空间分布图（逐格点 ACC + 打点）
         self.plot_acc_spatial_maps(model_temporal_acc_maps)
         # === 新增：绘制区域分析折线图（9个子区域） ===
         logger.info(f"检查区域数据: {len(region_spatial_acc_data)} 个区域")
@@ -1084,27 +1090,45 @@ class SeasonalMonthlyPearsonAnalyzer:
             logger.error(f"ACC空间分布图绘制失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
-    
-    def plot_spatial_acc_heatmap_diverging_discrete(self, model_spatial_acc_data):
+
+    def plot_spatial_acc_heatmap_diverging_discrete(self, region_spatial_acc_data: Optional[Dict] = None):
         """
-        绘制离散型、对称分布（RdBu_r）的空间ACC热图
+        绘制离散型、对称分布（RdBu_r）的热图。
+        修改说明：
+        1. 所有子图均显示横纵坐标 (Month, Lead Time)。
+        2. 使用 subplots_adjust 控制子图间距。
+        3. 关闭 sharex/sharey。
         """
         try:
-            logger.info(f"开始绘制离散型对称热图: {self.var_type}")
-            # 1. 基础数据准备
+            # --- 1. 数据检查与准备 ---
+            if region_spatial_acc_data is None or 'Global' not in region_spatial_acc_data:
+                logger.warning("未提供 Global 区域数据，跳过热图绘制")
+                return
+
+            global_data = region_spatial_acc_data['Global']
+            # 筛选有数据的模型
+            plot_models = [m for m in MODELS if m in global_data and global_data[m]]
+            
+            if not plot_models:
+                logger.warning("Global 区域没有可用数据，跳过热图绘制")
+                return
+
+            logger.info(f"开始绘制离散型对称热图（Global Index ACC）: {self.var_type}")
+            
+            # 定义坐标轴
             months = np.arange(1, 13)
             leadtimes = np.arange(0, 6)
-            plot_models = [m for m in MODELS if m in model_spatial_acc_data and model_spatial_acc_data[m]]
             
-            # 预计算所有矩阵
+            # 预处理数据矩阵
             model_matrices = {}
             model_p_matrices = {}  # 存储 p-value 矩阵
-            
+
             for model in plot_models:
-                combined_ds = xr.concat(model_spatial_acc_data[model], dim='leadtime').sortby('leadtime')
+                acc_list = global_data[model]
+                combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
                 
                 # 提取 r
-                matrix = combined_ds['temporal_acc_mean'].reindex(leadtime=leadtimes, month=months).values
+                matrix = combined_ds['regional_index_acc'].reindex(leadtime=leadtimes, month=months).values
                 model_matrices[model] = matrix
                 
                 # 提取 p-value (如果存在)
@@ -1116,20 +1140,24 @@ class SeasonalMonthlyPearsonAnalyzer:
 
             if not model_matrices: return
             
-            # --- 动态计算对称离散色标 ---
-            # 范围固定为 -1 到 1，每 0.1 一个段
-            n_bins = 20  # -1 到 1 共 20 个 0.1 的区间
+            # --- 2. 设置绘图参数 ---
+            # 范围固定为 -1 到 1
+            n_bins = 20  
             levels = np.linspace(-1, 1, n_bins + 1)
             
-            # 创建离散色板：RdBu_r (反转红蓝: 蓝为负, 红为正)
+            # 创建离散色板：RdBu_r
             cmap = plt.get_cmap('RdBu_r', n_bins)
             norm = mcolors.BoundaryNorm(levels, ncolors=cmap.N, clip=True)
 
-            # 2. 绘图布局
-            fig, axes = plt.subplots(2, 4, figsize=(20, 9), sharex=True, sharey=True, constrained_layout=True)
+            # --- 3. 创建画布 ---
+            # 修改点：sharex=False, sharey=False 以显示所有坐标；取消 constrained_layout
+            # 适当增加 figsize 高度以容纳 X 轴标签
+            fig, axes = plt.subplots(2, 4, figsize=(22, 10), sharex=False, sharey=False)
+            
+            # 隐藏第一个子图 (0,0)
             axes[0, 0].axis('off')
 
-            # 网格边界定义
+            # 网格边界定义 (pcolormesh 需要边界坐标)
             x_edges = np.arange(0.5, 13.5, 1)
             y_edges = np.arange(-0.5, 6.5, 1)
             X, Y = np.meshgrid(x_edges, y_edges)
@@ -1138,7 +1166,12 @@ class SeasonalMonthlyPearsonAnalyzer:
             X_center, Y_center = np.meshgrid(months, leadtimes)
 
             mesh = None
+            
+            # --- 4. 循环绘制每个模型 ---
             for i, model in enumerate(plot_models):
+                # 计算行列索引 (跳过 (0,0))
+                # i=0 -> (0,1), i=1 -> (0,2), i=2 -> (0,3)
+                # i=3 -> (1,0), i=4 -> (1,1) ...
                 row, col = (0, i + 1) if i < 3 else (1, i - 3)
                 ax = axes[row, col]
                 
@@ -1150,31 +1183,41 @@ class SeasonalMonthlyPearsonAnalyzer:
                                      edgecolor='face', linewidth=0.1, shading='flat')
 
                 # --- 显著性打点 ---
-                if p_matrix is not None:
-                    # 找到 p < 0.05 的位置 (且数据不是 NaN)
+                if p_matrix is not None and np.isfinite(p_matrix).any():
+                    # 找到 p < 0.05 的位置
                     sig_mask = (p_matrix < 0.05) & np.isfinite(matrix)
                     if np.any(sig_mask):
                         ax.scatter(X_center[sig_mask], Y_center[sig_mask], 
-                                   marker='.', s=15, color='black', alpha=0.6, label='p<0.05')
+                                   marker='.', s=18, color='black', alpha=0.8, label='p<0.05')
 
-                # 装饰细节
-                display_name = model.split('-')[0]
-                ax.set_title(f"({chr(97+i)}) {display_name}", fontsize=15, fontweight='bold', loc='left', pad=15)
+                # 模型名称
+                display_name = model.replace('-mon', '').replace('mon-', '')
+                ax.set_title(f"({chr(97+i)}) {display_name}", fontsize=18, fontweight='bold', loc='left', pad=10)
+                
+                # 设置刻度
                 ax.set_xticks(months)
                 ax.set_yticks(leadtimes)
                 
-                if col == 0 or (row == 0 and col == 1):
-                    ax.set_ylabel('Lead Time', fontsize=14)
-                if row == 1:
-                    ax.set_xlabel('Month', fontsize=14)
+                # 修改点：为所有子图设置标签
+                ax.set_xlabel('Month', fontsize=16)
+                ax.set_ylabel('Lead Time', fontsize=16)
+                
+                # 微调刻度标签字体大小
+                ax.tick_params(axis='both', which='major', labelsize=14)
                 ax.grid(False)
 
-            # 3. 全局 Colorbar 设置
+            # --- 5. 调整布局与 Colorbar ---
+            
+            # 修改点：手动调整子图间距
+            # wspace: 子图水平间距, hspace: 子图垂直间距
+            plt.subplots_adjust(left=0.05, right=0.90, top=0.92, bottom=0.10, wspace=0.3, hspace=0.35)
+
+            # 修改点：使用 add_axes 固定 Colorbar 位置，避免挤压子图
             if mesh:
-                # spacing='proportional' 确保色条刻度与 levels 一致
-                cbar = fig.colorbar(mesh, ax=axes, orientation='vertical', 
-                                    fraction=0.02, pad=0.04, ticks=levels)
-                cbar.set_label('Mean Temporal ACC', fontsize=14, labelpad=15)
+                # [left, bottom, width, height]
+                cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
+                cbar = fig.colorbar(mesh, cax=cbar_ax, orientation='vertical', ticks=levels)
+                cbar.set_label('Global Index ACC', fontsize=14, labelpad=15)
                 
             output_file = self.plot_dir / f"spatial_acc_heatmap_diverging_{self.var_type}.png"
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -1205,6 +1248,44 @@ class SeasonalMonthlyPearsonAnalyzer:
                 logger.info(f"Temporal ACC 空间分布已保存: {save_path}")
             except Exception as e:
                 logger.error(f"保存 Temporal ACC 空间分布失败 ({model}): {e}")
+
+    def save_region_index_acc_to_nc(self, region_spatial_acc_data: Dict):
+        """将区域 Index ACC（Global + 9 区）保存为 NetCDF，供 plot_only 时加载热图与折线图。"""
+        if not region_spatial_acc_data:
+            return
+        for region_name, model_data in region_spatial_acc_data.items():
+            for model, acc_list in model_data.items():
+                if not acc_list:
+                    continue
+                try:
+                    combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
+                    safe_region = region_name.replace(' ', '_')
+                    save_path = self.region_index_acc_dir / f"region_index_acc_{safe_region}_{model}_{self.var_type}.nc"
+                    combined_ds.to_netcdf(save_path)
+                except Exception as e:
+                    logger.warning(f"保存区域 Index ACC 失败 ({region_name} {model}): {e}")
+        logger.info("区域 Index ACC 已保存到: %s", self.region_index_acc_dir)
+
+    def load_region_index_acc_from_nc(self, models: List[str]) -> Dict:
+        """从 NetCDF 加载区域 Index ACC，用于 plot_only 时绘制热图与 Global/区域折线图。"""
+        region_spatial_acc_data = {r: {m: [] for m in models} for r in REGIONS.keys()}
+        for region_name in REGIONS.keys():
+            safe_region = region_name.replace(' ', '_')
+            for model in models:
+                save_path = self.region_index_acc_dir / f"region_index_acc_{safe_region}_{model}_{self.var_type}.nc"
+                if not save_path.exists():
+                    continue
+                try:
+                    with xr.open_dataset(save_path) as ds:
+                        ds_loaded = ds.load()
+                    if 'regional_index_acc' not in ds_loaded:
+                        continue
+                    for lt in ds_loaded.leadtime.values:
+                        lt_ds = ds_loaded.sel(leadtime=lt).expand_dims(leadtime=[lt])
+                        region_spatial_acc_data[region_name][model].append(lt_ds)
+                except Exception as e:
+                    logger.warning(f"加载区域 Index ACC 失败 ({region_name} {model}): {e}")
+        return region_spatial_acc_data
 
     def save_spatial_acc_to_nc(self, model_spatial_acc_data: Dict[str, List[xr.Dataset]]):
         """将空间ACC时间序列保存为NetCDF文件"""
@@ -1281,204 +1362,55 @@ class SeasonalMonthlyPearsonAnalyzer:
             
             logger.info(f"数据已保存: {annual_path}, {interannual_path}, {seasonal_path}, {monthly_path}")
 
-    def plot_spatial_acc_monthly_contour(self, model_spatial_acc_data: Dict[str, List[xr.DataArray]]):
-        """绘制空间ACC逐月等高线图"""
-        return
-        try:
-            logger.info(f"开始绘制空间ACC逐月等高线图: {self.var_type}")
-            
-            # 准备数据：{model: np.array(leadtime, month)}
-            model_contour_data = {}
-            all_values = []
-            
-            model_names = [m for m in model_spatial_acc_data.keys() if model_spatial_acc_data[m]]
-            if not model_names:
-                logger.warning("没有可用的空间ACC数据用于绘图")
-                return
-
-            for model in model_names:
-                acc_list = model_spatial_acc_data[model]
-                combined_acc = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
-                
-                # combined_acc 维度为 (leadtime, month)
-                leadtimes = combined_acc.leadtime.values
-                months = list(range(1, 13))
-                contour_matrix = np.full((len(leadtimes), len(months)), np.nan)
-                
-                for li, lt in enumerate(leadtimes):
-                    # 提取该leadtime的数据
-                    lt_data = combined_acc.sel(leadtime=lt)
-                    
-                    for mi, mon in enumerate(months):
-                        if mon in lt_data.month.values:
-                            val = float(lt_data.sel(month=mon).item())
-                            if np.isfinite(val):
-                                contour_matrix[li, mi] = val
-                                all_values.append(val)
-                
-                model_contour_data[model] = contour_matrix
-            
-            if not all_values:
-                logger.warning("没有有效的ACC数据用于绘制等高线图")
-                return
-
-            # 创建图形：2行4列布局，使用 constrained_layout 自动处理间距
-            fig, axes = plt.subplots(2, 4, figsize=(20, 10), sharex=True, sharey=True, constrained_layout=True)
-            
-            # 隐藏第一行第一个子图 (实现第一排3个右对齐)
-            axes[0, 0].axis('off')
-
-            # 排序模型以保证一致性
-            plot_models = [m for m in MODELS if m in model_contour_data]
-            
-            for i, model in enumerate(plot_models):
-                if i < 3:
-                     # 第一排3个，右对齐。
-                     row = 0
-                     col = i + 1 # 1, 2, 3
-                else:
-                     # 第二排4个
-                     row = 1
-                     col = i - 3 # 0, 1, 2, 3
-                
-                ax = axes[row, col]
-                display_name = model.replace('-mon', '').replace('mon-', '')
-                
-                data = model_contour_data[model]
-                lts = combined_acc.leadtime.values
-                mons = list(range(1, 13))
-                X, Y = np.meshgrid(mons, lts)
-                
-                # 确定等高线级别
-                valid_data = data[~np.isnan(data)]
-                if len(valid_data) > 0:
-                    data_min, data_max = np.nanmin(data), np.nanmax(data)
-                    if data_max - data_min > 1e-6:
-                        # 使用 MaxNLocator 自动选择等间距且“美观”的刻度（类似 0.1, 0.2, 0.5 等）
-                        levels = ticker.MaxNLocator(nbins=7, prune=None).tick_values(data_min, data_max)
-                    else:
-                        levels = 6
-                else:
-                    levels = 6
-                
-                contours = ax.contour(X, Y, data, levels=levels, colors='black', linewidths=1.2, alpha=0.8)
-                ax.clabel(contours, inline=True, fontsize=12, fmt='%.2f')
-                
-                # 标题增加 pad，防止贴合坐标轴
-                ax.set_title(f"({chr(97+i)}) {display_name}", fontsize=16, fontweight='bold', loc='left', pad=15)
-                
-                # 网格线
-                ax.grid(True, linestyle='--', alpha=0.3)
-                
-                # 坐标轴刻度设置
-                ax.set_xticks(mons)
-                ax.set_yticks(lts)
-                
-                ax.tick_params(axis='both', labelsize=12)
-                
-                # 只在第二行子图添加 Month 标注
-                if row == 1:
-                    ax.set_xlabel('Month', fontsize=14)
-                
-                # 只在每行第一个有图的子图添加 Lead Time 标注
-                if col == 0 or (row == 0 and col == 1):
-                    ax.set_ylabel('Lead Time', fontsize=14)
-            
-            output_file = self.plot_dir / f"spatial_acc_monthly_contour_{self.var_type}.png"
-            plt.savefig(output_file, dpi=300)
-            plt.close()
-            logger.info(f"空间ACC逐月等高线图已保存: {output_file}")
-            
-        except Exception as e:
-            logger.error(f"绘制空间ACC逐月等高线图出错: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-
-    def plot_spatial_acc_leadtime_timeseries(self, model_spatial_acc_data: Dict[str, List[xr.DataArray]], 
-                                             region_spatial_acc_data: Dict = None):
+    def plot_spatial_acc_leadtime_timeseries(self, region_spatial_acc_data: Optional[Dict] = None):
         """
-        绘制空间ACC随leadtime变化的折线图
-        
-        如果提供了 region_spatial_acc_data 且包含 'Global'，会使用 Global 区域的 Index ACC 数据
-        否则使用原有的 Temporal ACC 空间平均数据
+        [双轨制] 绘制 Global 区域的 Index ACC 随 Leadtime 变化的折线图。
+        严格使用全区域 Index ACC 数据（先区域平均再算相关），不使用旧的 Mean Temporal ACC。
+        region_spatial_acc_data 为 None 或缺少 Global 时跳过绘制（如 plot_only 模式）。
         """
         try:
-            logger.info(f"开始绘制空间ACC随leadtime变化的折线图: {self.var_type}")
-            
+            if region_spatial_acc_data is None or 'Global' not in region_spatial_acc_data:
+                logger.warning("未提供 Global 区域数据，跳过 Global Index ACC 折线图绘制")
+                return
+
+            global_data = region_spatial_acc_data['Global']
+            plot_models = [m for m in MODELS if m in global_data and global_data[m]]
+            if not plot_models:
+                logger.warning("Global 区域没有可用数据，跳过 Global Index ACC 折线图绘制")
+                return
+
+            logger.info(f"开始绘制 Global Index ACC 折线图: {self.var_type}")
             fig, ax = plt.subplots(figsize=(10, 6))
-            
-            # 优先使用 Global 区域数据
-            use_global_region = (region_spatial_acc_data is not None and 
-                                'Global' in region_spatial_acc_data)
-            
-            if use_global_region:
-                logger.info("使用 Global 区域的 Index ACC 数据")
-                global_data = region_spatial_acc_data['Global']
-                plot_models = [m for m in MODELS if m in global_data and global_data[m]]
-                if not plot_models:
-                    logger.warning("Global 区域没有可用数据，回退到原始方法")
-                    use_global_region = False
-            
-            if not use_global_region:
-                # 使用原有的 Temporal ACC 空间平均数据
-                plot_models = [m for m in MODELS if m in model_spatial_acc_data and model_spatial_acc_data[m]]
-                if not plot_models:
-                    logger.warning("没有可用的空间ACC数据用于绘制折线图")
-                    plt.close()
-                    return
-
             cmap = plt.get_cmap('tab10')
             all_leadtimes = set()
-            
+
             for i, model in enumerate(plot_models):
-                if use_global_region:
-                    # 使用 Global 区域的 regional_index_acc
-                    acc_list = global_data[model]
-                    combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
-                    # 提取 regional_index_acc 并计算年度平均
-                    combined_acc = combined_ds['regional_index_acc'].mean(dim='month', skipna=True)
-                    x_vals = combined_acc.leadtime.values
-                    y_vals = combined_acc.values
-                else:
-                    # 使用原有的 temporal_acc_mean
-                    acc_list = model_spatial_acc_data[model]
-                    combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
-                    combined_acc = combined_ds['temporal_acc_mean']
-                    all_leadtimes.update(combined_acc.leadtime.values)
-                    leadtime_means = combined_acc.mean(dim='month', skipna=True)
-                    x_vals = leadtime_means.leadtime.to_numpy()
-                    y_vals = leadtime_means.to_numpy()
-                
-                # 确保是数组
-                x_vals = np.atleast_1d(x_vals)
-                y_vals = np.atleast_1d(y_vals)
-                
-                ax.plot(x_vals, y_vals, 
+                acc_list = global_data[model]
+                combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
+                mean_acc = combined_ds['regional_index_acc'].mean(dim='month', skipna=True)
+                x_vals = np.atleast_1d(mean_acc.leadtime.values)
+                y_vals = np.atleast_1d(mean_acc.values)
+                all_leadtimes.update(int(x) for x in mean_acc.leadtime.values)
+                ax.plot(x_vals, y_vals,
                         marker='o', linewidth=2, label=model.replace('-mon', '').replace('mon-', ''),
                         color=cmap(i % cmap.N))
-            
+
+            ax.set_ylabel('All Regions Mean ACC', fontsize=14)
             ax.set_xlabel('Lead Time', fontsize=14)
-            ylabel = 'All Regions Mean ACC' if use_global_region else 'Mean Temporal ACC'
-            ax.set_ylabel(ylabel, fontsize=14)
+            # ax.set_title(f'Global Prediction Skill (Index ACC) - {self.var_type.upper()}', fontsize=16)
             if all_leadtimes:
-                # 转换 set 为 sorted list
-                xticks_list = sorted(list(all_leadtimes))
-                # 确保是 int 类型
-                xticks_list = [int(x) for x in xticks_list]
-                ax.set_xticks(xticks_list)
+                ax.set_xticks(sorted(all_leadtimes))
             ax.grid(True, linestyle=':', alpha=0.6)
-            
-            # 图例放在图像横轴下方，限制四列
-            ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15),
-                      ncol=4, fontsize=12, frameon=False)
-            
+            ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.3), ncol=4, fontsize=14, frameon=False)
+
+            plt.tight_layout()
             output_file = self.plot_dir / f"spatial_acc_leadtime_timeseries_{self.var_type}.png"
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
             plt.close()
-            logger.info(f"空间ACC随leadtime折线图已保存: {output_file}")
-            
+            logger.info(f"All Regions Mean ACC 折线图已保存: {output_file}")
+
         except Exception as e:
-            logger.error(f"绘制空间ACC折线图出错: {e}")
+            logger.error(f"All Regions Mean ACC 折线图绘制失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
     
@@ -1558,17 +1490,16 @@ class SeasonalMonthlyPearsonAnalyzer:
                     # 记录值以确定范围
                     all_vals.extend(y_vals[np.isfinite(y_vals)])
                     
-                    # 只在第一个区域显示图例标签
                     label = model.replace('-mon', '').replace('mon-', '') if reg_name == regions[0] else ""
                     ax.plot(x_vals, y_vals,
                            marker='o', linewidth=2, markersize=6,
                            label=label,
                            color=cmap(mi % cmap.N))
                 
-                ax.set_title(reg_name, fontsize=14, fontweight='bold')
+                ax.set_title(reg_name, fontsize=16, fontweight='bold')
                 ax.grid(True, linestyle=':', alpha=0.6)
-                ax.set_xlabel('Lead Time', fontsize=11)
-                ax.set_ylabel('Regional Index ACC', fontsize=11)
+                ax.set_xlabel('Lead Time', fontsize=16)
+                # ax.set_ylabel('ACC', fontsize=14)
             
             # 设置统一的 X 轴刻度
             for ax in axes_dict.values():
@@ -1585,8 +1516,8 @@ class SeasonalMonthlyPearsonAnalyzer:
             first_ax = axes_dict[regions[0]]
             handles, labels = first_ax.get_legend_handles_labels()
             if handles:
-                fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, -0.02),
-                          ncol=4, fontsize=12, frameon=False)
+                fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0),
+                          ncol=4, fontsize=16, frameon=False)
             
             plt.subplots_adjust(top=0.95, bottom=0.1, hspace=0.3, wspace=0.15)
             
@@ -1666,12 +1597,19 @@ class SeasonalMonthlyPearsonAnalyzer:
             # 加载ACC空间分布数据
             model_temporal_acc_maps = self.load_temporal_acc_maps_from_nc(models)
             
-            # 加载现有的汇总数据结果以便能够运行绘图（部分绘图可能依赖 results）
-            # 注意：这里的 results 主要用于 save_data_to_csv，如果是 plot_only，我们只绘图
+            # 加载区域 Index ACC（有则绘制热图与 Global/区域折线图）
+            region_spatial_acc_data = self.load_region_index_acc_from_nc(models)
+            has_region_data = bool(region_spatial_acc_data and any(
+                len(data) > 0 for models_data in region_spatial_acc_data.values() for data in models_data.values()
+            ))
+            if has_region_data:
+                logger.info("已加载区域 Index ACC 数据，将绘制热图与 Global/区域折线图")
+                self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
+                self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
+                self.plot_regional_index_acc_leadtime_timeseries(region_spatial_acc_data)
+            else:
+                logger.info("未找到区域 Index ACC 数据，热图与 Global/区域折线图已跳过（请先运行一次完整计算以生成数据）")
             # self.plot_spatial_acc_monthly_contour(model_spatial_acc_data)
-            self.plot_spatial_acc_heatmap_diverging_discrete(model_spatial_acc_data)
-            # plot_only 模式暂不支持区域数据，传入 None
-            self.plot_spatial_acc_leadtime_timeseries(model_spatial_acc_data, None)
             # 绘制ACC空间分布图
             self.plot_acc_spatial_maps(model_temporal_acc_maps)
             logger.info("绘图完成。")
@@ -1745,13 +1683,16 @@ class SeasonalMonthlyPearsonAnalyzer:
             self.save_spatial_acc_to_nc(model_spatial_acc_data)
             # 并行模式下保存逐格点 Temporal ACC 空间分布
             self.save_temporal_acc_maps_to_nc(model_temporal_acc_maps)
+            # 保存区域 Index ACC（供 plot_only 时加载）
+            self.save_region_index_acc_to_nc(region_spatial_acc_data)
             
             # 新增：绘制结果图表
             # self.plot_spatial_acc_monthly_contour(model_spatial_acc_data)
-            self.plot_spatial_acc_heatmap_diverging_discrete(model_spatial_acc_data)
-            # 绘制空间ACC随leadtime折线图（使用Global区域数据）
-            self.plot_spatial_acc_leadtime_timeseries(model_spatial_acc_data, region_spatial_acc_data)
-            # 绘制ACC空间分布图 (Lead 0 和 Lead 3)
+            # 热图使用与折线图一致的数据源（Global Index ACC）
+            self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
+            # [双轨制] 绘制 Global Index ACC 折线图（仅用 region 数据）
+            self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
+            # 绘制空间分布图（逐格点 ACC + 打点）
             self.plot_acc_spatial_maps(model_temporal_acc_maps)
             # === 新增：绘制区域分析折线图（9个子区域） ===
             logger.info(f"检查并行模式区域数据: {len(region_spatial_acc_data)} 个区域")
