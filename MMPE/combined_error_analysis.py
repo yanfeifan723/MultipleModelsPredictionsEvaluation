@@ -191,40 +191,65 @@ class MultiModelErrorAnalyzer:
             logger.error(f"格点计算失败: {e}")
             return None
 
-    def calculate_regional_metrics(self, obs: xr.DataArray, fcst: xr.DataArray, 
+    def calculate_regional_metrics(self, obs: xr.DataArray, fcst: xr.DataArray,
                                    region_bounds: Optional[Dict]) -> xr.Dataset:
-        """计算区域平均指标"""
+        """计算区域的月度、季节和年度指标 (RMSE, MAE, Bias)"""
         try:
             obs_reg = obs
             fcst_reg = fcst
-            
+
+            # 1. 区域截取
             if region_bounds is not None:
                 lat_b = region_bounds['lat']
                 lon_b = region_bounds['lon']
                 lat_slice = slice(lat_b[0], lat_b[1]) if obs_reg.lat[0] < obs_reg.lat[-1] else slice(lat_b[1], lat_b[0])
                 obs_reg = obs_reg.sel(lat=lat_slice, lon=slice(lon_b[0], lon_b[1]))
                 fcst_reg = fcst_reg.sel(lat=lat_slice, lon=slice(lon_b[0], lon_b[1]))
-            
-            # 加权平均 (忽略NaN即忽略海洋)
+
+            # 2. 计算空间加权平均的时间序列
             weights = np.cos(np.deg2rad(obs_reg.lat))
             weights.name = "weights"
+
             diff = fcst_reg - obs_reg
-            
-            # RMSE
-            mse_val = (diff**2).weighted(weights).mean(dim=['lat', 'lon'], skipna=True).mean(dim='time')
-            rmse_val = np.sqrt(mse_val)
-            
-            # MAE
-            mae_val = np.abs(diff).weighted(weights).mean(dim=['lat', 'lon'], skipna=True).mean(dim='time')
-            
-            # Bias
-            bias_val = diff.weighted(weights).mean(dim=['lat', 'lon'], skipna=True).mean(dim='time')
-            
-            return xr.Dataset({
-                'rmse': float(rmse_val), 
-                'mae': float(mae_val), 
-                'bias': float(bias_val)
+            diff_sq = diff ** 2
+            diff_abs = np.abs(diff)
+
+            # 空间平均 -> 得到时间序列
+            mse_ts = diff_sq.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
+            mae_ts = diff_abs.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
+            bias_ts = diff.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
+
+            # 3. 按月份聚合 (1-12月)
+            rmse_mon = np.sqrt(mse_ts.groupby('time.month').mean('time'))
+            mae_mon = mae_ts.groupby('time.month').mean('time')
+            bias_mon = bias_ts.groupby('time.month').mean('time')
+
+            # 4. 按季节聚合
+            rmse_seas = np.sqrt(mse_ts.groupby('time.season').mean('time'))
+
+            # 5. 年度聚合
+            rmse_annual = np.sqrt(mse_ts.mean('time'))
+            mae_annual = mae_ts.mean('time')
+            bias_annual = bias_ts.mean('time')
+
+            # 标量 (供原有折线图 plot_line_metrics 使用)
+            rmse_val = float(rmse_annual.values) if hasattr(rmse_annual, 'values') else float(rmse_annual)
+            mae_val = float(mae_annual.values) if hasattr(mae_annual, 'values') else float(mae_annual)
+            bias_val = float(bias_annual.values) if hasattr(bias_annual, 'values') else float(bias_annual)
+
+            ds = xr.Dataset({
+                'rmse_monthly': rmse_mon,
+                'mae_monthly': mae_mon,
+                'bias_monthly': bias_mon,
+                'rmse_seasonal': rmse_seas,
+                'rmse_annual': rmse_annual,
+                'mae_annual': mae_annual,
+                'bias_annual': bias_annual,
+                'rmse': rmse_val,
+                'mae': mae_val,
+                'bias': bias_val,
             })
+            return ds
         except Exception as e:
             logger.error(f"区域计算失败: {e}")
             return None
