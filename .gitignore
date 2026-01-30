@@ -57,9 +57,13 @@ Thumbs.db
 monitor_system.sh
 
 # 备份目录
-MMPE_backup/
+backup_MMPE/
 toolkit_backup/
+backup_boundaries/
 *.backup.py
+
+# 地理边界数据（shapefile）
+boundaries/
 
 # Cursor 相关
 .cursor/plans/
