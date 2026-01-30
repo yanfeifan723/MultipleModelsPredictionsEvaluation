@@ -229,6 +229,65 @@ class MultiModelErrorAnalyzer:
             logger.error(f"区域计算失败: {e}")
             return None
 
+    def save_spatial_maps(self, model_metric_maps: Dict, models: List[str], leadtimes: List[int]):
+        """保存空间图数据，供 --plot-only 时加载"""
+        for model in models:
+            for lt in leadtimes:
+                if model not in model_metric_maps or lt not in model_metric_maps[model]:
+                    continue
+                fpath = self.spatial_map_dir / f"{model}_L{lt}.nc"
+                try:
+                    model_metric_maps[model][lt].to_netcdf(fpath)
+                except Exception as e:
+                    logger.warning(f"保存空间图失败 {fpath}: {e}")
+
+    def load_spatial_maps(self, models: List[str], leadtimes: List[int]) -> Dict:
+        """从磁盘加载空间图数据"""
+        out = {m: {} for m in models}
+        for model in models:
+            for lt in leadtimes:
+                fpath = self.spatial_map_dir / f"{model}_L{lt}.nc"
+                if not fpath.exists():
+                    logger.warning(f"未找到 {fpath}，跳过")
+                    continue
+                try:
+                    out[model][lt] = xr.open_dataset(fpath)
+                except Exception as e:
+                    logger.warning(f"加载失败 {fpath}: {e}")
+        return out
+
+    def save_region_metrics(self, region_metric_data: Dict, models: List[str]):
+        """保存区域指标数据，供 --plot-only 时加载"""
+        for r_name in REGIONS:
+            if r_name not in region_metric_data:
+                continue
+            for model in models:
+                ds_list = region_metric_data[r_name].get(model, [])
+                if not ds_list:
+                    continue
+                try:
+                    combined = xr.concat(ds_list, dim='leadtime').sortby('leadtime')
+                    fpath = self.region_metric_dir / f"{r_name}_{model}.nc"
+                    combined.to_netcdf(fpath)
+                except Exception as e:
+                    logger.warning(f"保存区域指标失败 {r_name} {model}: {e}")
+
+    def load_region_metrics(self, models: List[str]) -> Dict:
+        """从磁盘加载区域指标数据"""
+        out = {r: {m: [] for m in models} for r in REGIONS}
+        for r_name in REGIONS:
+            for model in models:
+                fpath = self.region_metric_dir / f"{r_name}_{model}.nc"
+                if not fpath.exists():
+                    continue
+                try:
+                    ds = xr.open_dataset(fpath)
+                    for lt in ds.leadtime.values:
+                        out[r_name][model].append(ds.sel(leadtime=lt))
+                except Exception as e:
+                    logger.warning(f"加载区域指标失败 {fpath}: {e}")
+        return out
+
     def get_plotting_params(self, metric: str):
         """
         获取绘图参数 (Colormap, Levels, Norm, Extend)
@@ -346,7 +405,7 @@ class MultiModelErrorAnalyzer:
                     if col_idx == 0:
                         ax = fig.axes[-1]
                         ax.text(0.98, 0.96, f'L{leadtime}', transform=ax.transAxes, 
-                               fontsize=18, fontweight='bold', va='top', ha='right')
+                               fontsize=22, fontweight='bold', va='top', ha='right')
                 # 第二行
                 for col_idx in range(4):
                     model_idx = col_idx + 3
@@ -358,7 +417,7 @@ class MultiModelErrorAnalyzer:
             cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.75])
             cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cbar_ax, 
                                ticks=levels[::2], extend=extend)
-            cbar.set_label(f'{title_metric} ({self.unit_label})', fontsize=14)
+            cbar.set_label(f'{title_metric} ({self.unit_label})', fontsize=18)
             
             output_file = self.plot_dir / f"{metric_key}_spatial_maps_L0_L3_{self.var_type}.png"
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -397,7 +456,7 @@ class MultiModelErrorAnalyzer:
         
         display_name = model.replace('-mon', '').replace('mon-', '')
         ax.text(0.02, 0.96, f"({label_char}) {display_name}", transform=ax.transAxes,
-               fontsize=14, fontweight='bold', va='top')
+               fontsize=18, fontweight='bold', va='top')
 
     def plot_line_metrics(self, region_metric_data: Dict, metric: str, is_global: bool = False):
         """绘制折线图"""
@@ -450,8 +509,8 @@ class MultiModelErrorAnalyzer:
                 if not is_global: ax.set_title(reg, fontweight='bold')
                 ax.grid(True, linestyle=':')
                 ax.set_xticks(LEADTIMES)
-                ax.set_xlabel('Lead Time (months)', fontsize=12)
-                ax.set_ylabel(f'{metric.upper()} ({self.unit_label})', fontsize=12)
+                ax.set_xlabel('Lead Time (months)', fontsize=16)
+                ax.set_ylabel(f'{metric.upper()} ({self.unit_label})', fontsize=16)
 
             # 统一Y轴
             if all_vals:
@@ -464,8 +523,12 @@ class MultiModelErrorAnalyzer:
             # Legend
             handles, labels = list(axes.values())[0].get_legend_handles_labels()
             if handles:
-                fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=14, 
-                          bbox_to_anchor=(0.5, -0.05 if is_global else 0))
+                if is_global:
+                    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=13, 
+                              bbox_to_anchor=(0.5, -0.05))
+                else:
+                    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=18, 
+                              bbox_to_anchor=(0.5, -0.05))
 
             plt.subplots_adjust(top=0.95, bottom=0.15 if is_global else 0.1, hspace=0.3, wspace=0.2)
             plt.savefig(self.plot_dir / fname, dpi=300, bbox_inches='tight')
@@ -475,10 +538,21 @@ class MultiModelErrorAnalyzer:
         except Exception as e:
             logger.error(f"折线图绘制失败: {e}")
 
-    def run_analysis(self, models=None, leadtimes=None, parallel=False, n_jobs=None):
+    def run_analysis(self, models=None, leadtimes=None, parallel=False, n_jobs=None, plot_only=False):
         models = models or MODELS
         leadtimes = leadtimes or LEADTIMES
         
+        if plot_only:
+            logger.info(f"仅绘图模式: {self.var_type}")
+            model_metric_maps = self.load_spatial_maps(models, leadtimes)
+            region_metric_data = self.load_region_metrics(models)
+            if not any(model_metric_maps[m] for m in models):
+                logger.warning("未找到已保存的空间图数据，请先运行完整分析")
+                return
+            self._do_plots(model_metric_maps, region_metric_data)
+            logger.info("仅绘图完成")
+            return
+
         model_metric_maps = {m: {} for m in models}
         region_metric_data = {r: {m: [] for m in models} for r in REGIONS}
         
@@ -509,22 +583,19 @@ class MultiModelErrorAnalyzer:
                     for r, ds in reg_dict.items():
                         region_metric_data[r][mod].append(ds)
 
-        # 绘图
-        # 1. RMSE Map
-        self.plot_metric_spatial_maps(model_metric_maps, 'rmse', 'RMSE')
-        
-        # 2. MAE Map
-        self.plot_metric_spatial_maps(model_metric_maps, 'mae', 'MAE')
+        self.save_spatial_maps(model_metric_maps, models, leadtimes)
+        self.save_region_metrics(region_metric_data, models)
+        self._do_plots(model_metric_maps, region_metric_data)
+        logger.info("所有分析完成")
 
-        # 3. Bias Map
+    def _do_plots(self, model_metric_maps: Dict, region_metric_data: Dict):
+        """执行所有绘图（空间图 + 折线图）"""
+        self.plot_metric_spatial_maps(model_metric_maps, 'rmse', 'RMSE')
+        self.plot_metric_spatial_maps(model_metric_maps, 'mae', 'MAE')
         self.plot_metric_spatial_maps(model_metric_maps, 'bias', 'Bias (Mean Error)')
-        
-        # 4. 折线图 (RMSE, MAE, Bias)
         for m in ['rmse', 'mae', 'bias']:
             self.plot_line_metrics(region_metric_data, m, is_global=True)
             self.plot_line_metrics(region_metric_data, m, is_global=False)
-        
-        logger.info("所有分析完成")
 
 def _compute_errors_task(var_type, model, leadtime):
     try:
@@ -554,9 +625,10 @@ def main():
     var_list = parse_vars(args.var) if args.var else ['temp', 'prec']
     parallel = normalize_parallel_args(args)
     
+    plot_only = getattr(args, 'plot_only', False)
     for var in var_list:
         analyzer = MultiModelErrorAnalyzer(var, n_jobs=args.n_jobs)
-        analyzer.run_analysis(models, leadtimes, parallel=parallel, n_jobs=args.n_jobs)
+        analyzer.run_analysis(models, leadtimes, parallel=parallel, n_jobs=args.n_jobs, plot_only=plot_only)
 
 if __name__ == "__main__":
     main()
