@@ -142,48 +142,31 @@ MODELS = MODEL_LIST
 MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-# === 定义区域（基于 SPATIAL_BOUNDS 生成 Global + 9个子区域） ===
+# === 定义区域（Global + 9个规则气候区划） ===
 def generate_regions():
     """
-    生成分析区域：Global（全域）+ 9个3×3网格子区域
-    子区域按照地理位置命名（基于中国地理分区）
-    
-    区域划分（从北到南，从西到东）：
-    - 北部：西北、华北、东北
-    - 中部：西部、华中、华东
-    - 南部：西南、华南、东南
+    生成分析区域：Global（全域）+ 9个规则气候区划
+    基于方案二：中国气候9大规则区划
     """
-    lat_min, lat_max = SPATIAL_BOUNDS['lat']
-    lon_min, lon_max = SPATIAL_BOUNDS['lon']
-    
-    lat_step = (lat_max - lat_min) / 3
-    lon_step = (lon_max - lon_min) / 3
-    
     regions = {'Global': None}  # None 表示使用全域
-    
-    # 定义区域名称（从北到南，从西到东）
-    region_names = [
-        ['Northwest', 'North China', 'Northeast'],      # 北部行
-        ['West', 'Central China', 'East China'],        # 中部行
-        ['Southwest', 'South China', 'Southeast']       # 南部行
-    ]
-    
-    # 生成 9 个子区域（从北到南，从西到东）
-    for i in range(2, -1, -1):  # 纬度：从高到低 (北到南)
-        for j in range(3):  # 经度：从低到高 (西到东)
-            r_lat_min = lat_min + i * lat_step
-            r_lat_max = lat_min + (i + 1) * lat_step
-            r_lon_min = lon_min + j * lon_step
-            r_lon_max = lon_min + (j + 1) * lon_step
-            
-            # 使用地理名称
-            row_idx = 2 - i  # 转换为从0开始的行索引
-            name = region_names[row_idx][j]
-            
-            regions[name] = {
-                'lat': (r_lat_min, r_lat_max),
-                'lon': (r_lon_min, r_lon_max)
-            }
+
+    # 定义9个区域的经纬度范围 (lat: min-max, lon: min-max)
+    # 依据方案二：中国气候 9 大规则区划
+    regions.update({
+        # --- 北部行 ---
+        'Z1-Northwest':     {'lat': (39, 49), 'lon': (73, 105)},   # 西北干旱区
+        'Z2-InnerMongolia': {'lat': (39, 50), 'lon': (106, 118)},  # 内蒙半干旱区
+        'Z3-Northeast':     {'lat': (40, 54), 'lon': (119, 135)},  # 东北湿润区
+        # --- 中部行 ---
+        'Z4-Tibetan':       {'lat': (27, 39), 'lon': (73, 95)},    # 青藏高寒区
+        'Z5-NorthChina':    {'lat': (34, 39), 'lon': (106, 122)},  # 黄土-华北区
+        'Z7-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},  # 长江中下游区
+        # --- 南部行 ---
+        'Z6-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},   # 四川-西南区
+        'Z8-SouthChina':    {'lat': (21, 25), 'lon': (106, 120)},  # 华南湿润区
+        'Z9-SouthSea':      {'lat': (18, 21), 'lon': (105, 125)}   # 南海热带区
+    })
+
     return regions
 
 REGIONS = generate_regions()
@@ -1475,7 +1458,7 @@ class SeasonalMonthlyPearsonAnalyzer:
                         color=cmap(i % cmap.N))
             
             ax.set_xlabel('Lead Time', fontsize=14)
-            ylabel = 'Regional Index ACC (Global)' if use_global_region else 'Mean Temporal ACC'
+            ylabel = 'All Regions Mean ACC' if use_global_region else 'Mean Temporal ACC'
             ax.set_ylabel(ylabel, fontsize=14)
             if all_leadtimes:
                 # 转换 set 为 sorted list
@@ -1510,14 +1493,13 @@ class SeasonalMonthlyPearsonAnalyzer:
             region_spatial_acc_data: {region_name: {model: [xr.Dataset]}}
         """
         try:
-            logger.info(f"开始绘制分区域 Index ACC 折线图（9个子区域）: {self.var_type}")
+            logger.info(f"开始绘制分区域 Index ACC 折线图（9大规则区划）: {self.var_type}")
             
-            # 定义区域显示顺序（按地理位置：从北到南，从西到东）
-            # 排除 Global，只保留9个子区域
+            # 区域显示顺序（对应 9 大规则区划）
             region_order = [
-                'Northwest', 'North China', 'Northeast',
-                'West', 'Central China', 'East China',
-                'Southwest', 'South China', 'Southeast'
+                'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
+                'Z4-Tibetan',   'Z5-NorthChina',    'Z7-Yangtze',
+                'Z6-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
             ]
             # 只保留实际存在的区域
             regions = [r for r in region_order if r in region_spatial_acc_data]
@@ -1525,17 +1507,20 @@ class SeasonalMonthlyPearsonAnalyzer:
                 logger.warning("没有可用的区域数据")
                 return
             
-            # 布局计算：9个子区域，使用3行×3列布局
+            # 布局计算：3行×3列
             n_cols = 3
             n_rows = 3
             
             fig = plt.figure(figsize=(18, 15))
             
-            # 创建subplot位置映射（3×3网格）
+            # subplot 位置映射（3×3网格）
+            # 第一行：西北(Z1) - 内蒙(Z2) - 东北(Z3)
+            # 第二行：青藏(Z4) - 华北(Z5) - 长江(Z7)
+            # 第三行：西南(Z6) - 华南(Z8) - 南海(Z9)
             subplot_positions = {
-                'Northwest': (0, 0), 'North China': (0, 1), 'Northeast': (0, 2),
-                'West': (1, 0), 'Central China': (1, 1), 'East China': (1, 2),
-                'Southwest': (2, 0), 'South China': (2, 1), 'Southeast': (2, 2)
+                'Z1-Northwest':     (0, 0), 'Z2-InnerMongolia': (0, 1), 'Z3-Northeast': (0, 2),
+                'Z4-Tibetan':       (1, 0), 'Z5-NorthChina':    (1, 1), 'Z7-Yangtze':   (1, 2),
+                'Z6-Southwest':     (2, 0), 'Z8-SouthChina':    (2, 1), 'Z9-SouthSea':  (2, 2)
             }
             
             cmap = plt.get_cmap('tab10')
