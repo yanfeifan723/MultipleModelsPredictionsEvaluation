@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多区域双重指标(RMSE & ACC)组合热图绘制模块 (Updated Layout V3 - Fixed)
+多区域双重指标(RMSE & ACC)组合热图绘制模块 (Updated Layout V4)
 功能：
 1. 绘制 Global 区域的 2x2 组合图
 2. 绘制 9个子区域(Z1-Z9) 的组合大图
 3. 布局调整：
-   - 去除多余标题
-   - 极度紧凑的间距
-   - 增大显著性打点 (s=25)
-   - 模式名称倾斜 45 度
-   - 修复 color bins 数量错误
+   - 恢复左上角 RMSE/ACC 标注
+   - 仅最外侧显示月份/季节/模式标签
+   - 进一步压缩子图间距 (hspace)
+   - Global图调整图例间距和宽度
 """
 
 import sys
@@ -142,7 +141,7 @@ class RegionalHeatMapPlotter:
 
     def _get_levels_and_cmap(self, all_vals, vtype='rmse'):
         """
-        获取 colorbar 配置，修复 bin 数量问题
+        获取 colorbar 配置
         """
         if vtype == 'rmse':
             valid = [x for x in all_vals if np.isfinite(x) and x >= 0]
@@ -153,7 +152,6 @@ class RegionalHeatMapPlotter:
             
             levels = np.linspace(vmin, vmax, N_RMSE_LEVELS)
             n_bins = len(levels) - 1
-            # extend='max' 需要 n_bins + 1 个颜色
             n_colors = n_bins + 1
             
             if self.var_type == 'temp': cmap = plt.get_cmap('Reds', n_colors)
@@ -164,7 +162,6 @@ class RegionalHeatMapPlotter:
             vmin, vmax = -1.0, 1.0
             levels = np.linspace(vmin, vmax, N_ACC_LEVELS)
             n_bins = len(levels) - 1
-            # extend='both' 需要 n_bins + 2 个颜色
             n_colors = n_bins + 2 
             
             cmap = plt.get_cmap('coolwarm', n_colors)
@@ -236,10 +233,9 @@ class RegionalHeatMapPlotter:
         models = [m for m in MODEL_LIST if m in global_data['rmse']]
         if not models: return
 
-        # Global 图 14x12
         fig = plt.figure(figsize=(14, 12))
-        # 紧凑间距
-        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.08, wspace=0.08)
+        # 极小间距
+        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.05, wspace=0.05)
         
         rmse_vals = []
         acc_vals = []
@@ -261,22 +257,30 @@ class RegionalHeatMapPlotter:
         
         for r, c, mode, metric, norm, cmap, levels in layouts:
             ax = fig.add_subplot(gs[r, c])
-            # Global图: 底部行显示X轴，左侧列显示Y轴
+            
+            # Labeling only outermost
             show_x = (r == 1)
             show_y = (c == 0)
             
             self._plot_single_heatmap(ax, global_data[metric], models, mode, metric, norm, cmap, levels, 
                                       show_xticklabels=show_x, show_yticklabels=show_y)
-            # 无标题
             
-        # Colorbars
-        cax_r = fig.add_axes([0.15, 0.05, 0.3, 0.02])
+            # 恢复 RMSE/ACC 标注 (左上角, 仅第一行)
+            if r == 0:
+                ax.text(0.5, 1.02, metric.upper(), transform=ax.transAxes, 
+                        fontsize=14, fontweight='bold', ha='center', va='bottom')
+            
+        # Colorbars: 增大间隔，变窄
+        # y=0.05 -> 0.02 (move down)
+        # height=0.02 -> 0.012 (narrower)
+        cax_r = fig.add_axes([0.15, 0.02, 0.3, 0.012])
         cb_r = plt.colorbar(ScalarMappable(norm=norm_r, cmap=cmap_r), cax=cax_r, orientation='horizontal', extend='max')
         cb_r.set_ticks(levels_r)
         cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
-        cb_r.set_label('RMSE', fontsize=12)
+        rmse_unit = '°C' if self.var_type == 'temp' else 'mm/day'
+        cb_r.set_label(f'RMSE ({rmse_unit})', fontsize=12)
         
-        cax_a = fig.add_axes([0.55, 0.05, 0.3, 0.02])
+        cax_a = fig.add_axes([0.55, 0.02, 0.3, 0.012])
         cb_a = plt.colorbar(ScalarMappable(norm=norm_a, cmap=cmap_a), cax=cax_a, orientation='horizontal', extend='both')
         cb_a.set_ticks(levels_a)
         cb_a.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
@@ -304,11 +308,11 @@ class RegionalHeatMapPlotter:
         norm_r, cmap_r, levels_r = self._get_levels_and_cmap(all_rmse, 'rmse')
         norm_a, cmap_a, levels_a = self._get_levels_and_cmap(all_acc, 'acc')
 
-        # 区域大图 26x22
         fig = plt.figure(figsize=(26, 22))
         
-        # 4大块布局，紧凑
-        outer_gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.1, wspace=0.08, height_ratios=[1, 0.4]) 
+        # 4大块布局
+        # hspace 0.1 -> 0.05
+        outer_gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.05, wspace=0.05, height_ratios=[1, 0.4]) 
         
         quadrants = [
             (0, 0, 'monthly', 'rmse', norm_r, cmap_r, levels_r),
@@ -324,10 +328,19 @@ class RegionalHeatMapPlotter:
         ]
 
         for qr, qc, mode, metric, norm, cmap, levels in quadrants:
-            # 内部3x3小图布局，极度紧凑
+            # 内部3x3小图布局
+            # hspace 0.2 -> 0.15 (squeezed but leaving space for Z-labels)
             inner_gs = gridspec.GridSpecFromSubplotSpec(3, 3, subplot_spec=outer_gs[qr, qc], 
-                                                        hspace=0.2, wspace=0.05)
+                                                        hspace=0.15, wspace=0.05)
             
+            # 恢复 RMSE/ACC 标注 (在每个大象限的上方)
+            if qr == 0:
+                 # 创建一个不可见的轴来放置标题
+                ax_title = fig.add_subplot(outer_gs[qr, qc])
+                ax_title.axis('off')
+                ax_title.text(0.5, 1.03, metric.upper(), transform=ax_title.transAxes, 
+                              fontsize=18, fontweight='bold', ha='center', va='bottom')
+
             for r in range(3):
                 for c in range(3):
                     reg_name = region_grid[r][c]
@@ -335,24 +348,26 @@ class RegionalHeatMapPlotter:
                     
                     data_to_plot = regions_data.get(reg_name, {}).get(metric, {})
                     
-                    # 仅在最底部的行 (row=2) 显示 X轴标签
-                    show_x = (r == 2)
-                    # 仅在最左侧的列 (col=0) 显示 Y轴标签
-                    show_y = (c == 0)
+                    # 仅在最底部的行 (row=2) 且是最下层的大块 (qr=1) 显示 X轴标签
+                    show_x = (qr == 1 and r == 2)
+                    
+                    # 仅在最左侧的列 (col=0) 且是最左侧的大块 (qc=0) 显示 Y轴标签
+                    show_y = (qc == 0 and c == 0)
                     
                     self._plot_single_heatmap(ax, data_to_plot, models, mode, metric, norm, cmap, levels,
                                               show_xticklabels=show_x, show_yticklabels=show_y)
                     
-                    # 仅保留 Z1~Z9 标注
+                    # Z1~Z9 标注
                     short_name = reg_name.split('-')[0] # Z1, Z2...
-                    ax.set_title(short_name, fontsize=11, pad=3, fontweight='bold')
+                    ax.set_title(short_name, fontsize=10, pad=3, fontweight='bold')
 
         # Colorbars
         cax_r = fig.add_axes([0.15, 0.05, 0.3, 0.015])
         cb_r = plt.colorbar(ScalarMappable(norm=norm_r, cmap=cmap_r), cax=cax_r, orientation='horizontal', extend='max')
         cb_r.set_ticks(levels_r)
         cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
-        cb_r.set_label('RMSE', fontsize=14)
+        rmse_unit = '°C' if self.var_type == 'temp' else 'mm/day'
+        cb_r.set_label(f'RMSE ({rmse_unit})', fontsize=14)
         
         cax_a = fig.add_axes([0.55, 0.05, 0.3, 0.015])
         cb_a = plt.colorbar(ScalarMappable(norm=norm_a, cmap=cmap_a), cax=cax_a, orientation='horizontal', extend='both')
