@@ -2,14 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 多区域双重指标(RMSE & ACC)组合热图绘制模块 (Updated Layout V4)
-功能：
-1. 绘制 Global 区域的 2x2 组合图
-2. 绘制 9个子区域(Z1-Z9) 的组合大图
-3. 布局调整：
-   - 恢复左上角 RMSE/ACC 标注
-   - 仅最外侧显示月份/季节/模式标签
-   - 进一步压缩子图间距 (hspace)
-   - Global图调整图例间距和宽度
+修改说明：
+1. 修复RMSE Colorbar刻度不规则问题，使用整齐的间隔（如0.1, 0.2等）。
+2. 关于季节ACC显著性打点：由于当前季节ACC是基于月度ACC的平均计算的，
+   缺乏严谨的季节尺度P值，故暂不显示打点以保证科学性。
 """
 
 import sys
@@ -93,10 +89,16 @@ class RegionalHeatMapPlotter:
                                     else:
                                         acc_entry['monthly'][m_name] = np.nan
                                         acc_entry['monthly_p'][m_name] = np.nan
+                                
+                                # 计算季节平均 ACC
                                 for seas, m_idxs in SEASONS.items():
                                     vals = [acc_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
                                     acc_entry['seasonal'][seas] = float(np.nanmean(vals))
+                                    # 注意：这里不能简单平均 P 值。
+                                    # 除非上游数据源提供了 'seasonal_p' 变量，否则保持为 NaN 以保证严谨性。
+                                    # 如果未来 combined_pearson_analysis.py 计算了季节 P 值并保存，可在此处读取。
                                     acc_entry['seasonal_p'][seas] = np.nan 
+
                                 data[lt]['acc'][model] = acc_entry
                     except Exception as e:
                         pass
@@ -142,20 +144,36 @@ class RegionalHeatMapPlotter:
     def _get_levels_and_cmap(self, all_vals, vtype='rmse'):
         """
         获取 colorbar 配置
+        修改：使用 MaxNLocator 获取整齐间隔的 Levels (如 0.1, 0.2) 而非不规则小数
         """
         if vtype == 'rmse':
             valid = [x for x in all_vals if np.isfinite(x) and x >= 0]
             vmin = 0
-            vmax = np.nanmax(valid) if valid else 1.0
-            if vmax > 5: vmax = np.ceil(vmax)
-            else: vmax = np.ceil(vmax * 10) / 10
+            vmax_raw = np.nanmax(valid) if valid else 1.0
             
-            levels = np.linspace(vmin, vmax, N_RMSE_LEVELS)
+            # 使用 MaxNLocator 寻找“漂亮”的刻度，nbins 设为 N_RMSE_LEVELS - 1 以保持类似的颜色分级数
+            # steps 定义了允许的步长倍数（1, 2, 2.5, 5, 10 等）
+            locator = ticker.MaxNLocator(nbins=N_RMSE_LEVELS-1, steps=[1, 2, 2.5, 5, 10])
+            levels = locator.tick_values(0, vmax_raw)
+            
+            # 过滤掉小于0的刻度（MaxNLocator有时候会为了对称包含负数）
+            levels = levels[levels >= 0]
+            
+            # 确保 levels 覆盖最大值
+            if levels[-1] < vmax_raw:
+                # 如果最大刻度小于实际最大值，手动增加一个步长
+                step = levels[1] - levels[0] if len(levels) > 1 else 1.0
+                while levels[-1] < vmax_raw:
+                    levels = np.append(levels, levels[-1] + step)
+            
+            # 更新颜色数量以匹配 levels
             n_bins = len(levels) - 1
             n_colors = n_bins + 1
             
             if self.var_type == 'temp': cmap = plt.get_cmap('Reds', n_colors)
             else: cmap = plt.get_cmap('Blues', n_colors)
+            
+            # extend='max' 允许超过最大level的值使用最后一个颜色
             norm = BoundaryNorm(levels, n_colors, extend='max')
             return norm, cmap, levels
         else:
@@ -201,6 +219,7 @@ class RegionalHeatMapPlotter:
 
                 if np.isfinite(val):
                     if metric == 'rmse':
+                        # 确保值在颜色映射范围内
                         val_clip = max(levels[0], min(val, levels[-1]))
                     else:
                         val_clip = max(-1, min(val, 1))
@@ -275,8 +294,21 @@ class RegionalHeatMapPlotter:
         # height=0.02 -> 0.012 (narrower)
         cax_r = fig.add_axes([0.15, 0.02, 0.3, 0.012])
         cb_r = plt.colorbar(ScalarMappable(norm=norm_r, cmap=cmap_r), cax=cax_r, orientation='horizontal', extend='max')
+        
+        # 修复：使用更新后的 nice levels 设置刻度
         cb_r.set_ticks(levels_r)
-        cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        
+        # 智能选择格式化字符串：如果全是整数，不显示小数
+        if all(x.is_integer() for x in levels_r):
+             cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
+        else:
+             # 如果间隔很小，增加小数位数
+             step = levels_r[1] - levels_r[0] if len(levels_r) > 1 else 0.1
+             if step < 0.1:
+                 cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
+             else:
+                 cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+
         rmse_unit = '°C' if self.var_type == 'temp' else 'mm/day'
         cb_r.set_label(f'RMSE ({rmse_unit})', fontsize=12)
         
@@ -365,7 +397,16 @@ class RegionalHeatMapPlotter:
         cax_r = fig.add_axes([0.15, 0.05, 0.3, 0.015])
         cb_r = plt.colorbar(ScalarMappable(norm=norm_r, cmap=cmap_r), cax=cax_r, orientation='horizontal', extend='max')
         cb_r.set_ticks(levels_r)
-        cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        
+        if all(x.is_integer() for x in levels_r):
+             cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
+        else:
+             step = levels_r[1] - levels_r[0] if len(levels_r) > 1 else 0.1
+             if step < 0.1:
+                 cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
+             else:
+                 cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+
         rmse_unit = '°C' if self.var_type == 'temp' else 'mm/day'
         cb_r.set_label(f'RMSE ({rmse_unit})', fontsize=14)
         
