@@ -89,7 +89,7 @@ def setup_map_style(ax):
     gl.xlabel_style = {'size': 12}
     gl.ylabel_style = {'size': 12}
 
-def plot_z_regions(output_file="Z1_Z9_regions_map_legend_bottom.png"):
+def plot_z_regions(output_file="regions_map.png"):
     """主绘图函数"""
     fig = plt.figure(figsize=(12, 10))
     ax = plt.axes(projection=ccrs.PlateCarree())
@@ -140,10 +140,6 @@ def plot_z_regions(output_file="Z1_Z9_regions_map_legend_bottom.png"):
         # 3. 为图例创建 Handle
         handles.append(mpatches.Patch(color=color, label=name, fill=False, linewidth=2.5))
 
-    # === 修改处：调整图例位置 ===
-    # loc='upper center': 图例的锚点在图例框的上方中间
-    # bbox_to_anchor=(0.5, -0.08): 放置在轴坐标(0.5, -0.08)处，即正下方
-    # ncol=5: 5列
     ax.legend(handles=handles, 
               loc='upper center', 
               bbox_to_anchor=(0.5, -0.08), 

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多区域双重指标(RMSE & ACC)组合热图绘制模块
+多区域双重指标(RMSE & ACC)组合热图绘制模块 (Updated Layout V3 - Fixed)
 功能：
-1. 遍历Global及9个子区域
-2. 读取 combined_error_analysis.py 生成的区域RMSE数据
-3. 读取 combined_pearson_analysis.py 生成的区域ACC数据
-4. 绘制包含 Month/Season x Models 的组合热图
+1. 绘制 Global 区域的 2x2 组合图
+2. 绘制 9个子区域(Z1-Z9) 的组合大图
+3. 布局调整：
+   - 去除多余标题
+   - 极度紧凑的间距
+   - 增大显著性打点 (s=25)
+   - 模式名称倾斜 45 度
+   - 修复 color bins 数量错误
 """
 
 import sys
@@ -16,12 +20,11 @@ import logging
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import matplotlib.patches as patches
+import matplotlib.gridspec as gridspec
 from matplotlib.colors import BoundaryNorm
 from matplotlib.cm import ScalarMappable
-import matplotlib.patheffects as pe
-from matplotlib.ticker import FormatStrFormatter
+from matplotlib import ticker
 from typing import Dict, List
 
 # 添加路径以导入配置
@@ -35,9 +38,9 @@ except ImportError:
     LEADTIMES = [0, 1, 2, 3, 4, 5]
     MODEL_LIST = ["CMCC-35", "DWD-mon-21", "ECMWF-51-mon", "Meteo-France-8", "NCEP-2", "UKMO-14", "ECCC-Canada-3"]
 
-# 区域定义 (与分析脚本保持一致)
-REGIONS_LIST = [
-    'Global',
+# 区域定义
+REGION_GLOBAL = 'Global'
+REGIONS_Z = [
     'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
     'Z4-Tibetan',   'Z5-NorthChina',    'Z7-Yangtze',
     'Z6-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
@@ -49,26 +52,20 @@ MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# RMSE/ACC 分段数（colorbar 段数 = N_LEVELS - 1）
-N_RMSE_LEVELS = 11   # 0 到 vmax 分 10 段
-N_ACC_LEVELS = 11    # -1 到 1 分 10 段
-
+# RMSE/ACC 分段数
+N_RMSE_LEVELS = 11
+N_ACC_LEVELS = 11
 
 class RegionalHeatMapPlotter:
     def __init__(self, var_type: str):
         self.var_type = var_type
-        # 数据路径配置
         self.acc_base_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/region_index_acc/{var_type}")
         self.rmse_base_dir = Path(f"/sas12t1/ffyan/output/error_analysis/region_metrics/{var_type}")
         self.output_dir = Path(f"/sas12t1/ffyan/output/heat_map_regional/{var_type}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def load_regional_data(self, region: str) -> Dict[int, Dict]:
-        """
-        加载指定区域的所有Leadtime和Model数据
-        返回结构: {leadtime: {'rmse': {model: {...}}, 'acc': {model: {...}}}}
-        包含 monthly, seasonal, annual 数据
-        """
+    def load_regional_data(self, region: str) -> Dict:
+        """加载数据"""
         data = {}
         safe_region = region.replace(' ', '_')
 
@@ -76,233 +73,311 @@ class RegionalHeatMapPlotter:
             data[lt] = {'rmse': {}, 'acc': {}}
 
             for model in MODEL_LIST:
-                # 1. 加载 ACC (from combined_pearson_analysis)
+                # 1. 加载 ACC
                 acc_file = self.acc_base_dir / f"region_index_acc_{safe_region}_{model}_{self.var_type}.nc"
+                acc_entry = {'monthly': {}, 'seasonal': {}, 'monthly_p': {}, 'seasonal_p': {}}
+                
                 if acc_file.exists():
                     try:
                         with xr.open_dataset(acc_file) as ds:
                             if int(lt) in ds.leadtime.values:
                                 ds_lt = ds.sel(leadtime=int(lt))
-                                # 提取月度 ACC
-                                mon_dict = {}
-                                for m in (ds_lt.month.values if hasattr(ds_lt, 'month') else range(1, 13)):
-                                    m = int(m)
+                                for m in range(1, 13):
+                                    m_name = MONTHS[m-1]
                                     if m in ds_lt.month.values:
-                                        mon_dict[MONTHS[m - 1]] = float(ds_lt.regional_index_acc.sel(month=m).values)
+                                        val = float(ds_lt.regional_index_acc.sel(month=m).values)
+                                        p_val = np.nan
+                                        if 'p_value' in ds_lt:
+                                            p_val = float(ds_lt.p_value.sel(month=m).values)
+                                        acc_entry['monthly'][m_name] = val
+                                        acc_entry['monthly_p'][m_name] = p_val
                                     else:
-                                        mon_dict[MONTHS[m - 1]] = np.nan
-                                if len(mon_dict) < 12:
-                                    for i in range(1, 13):
-                                        if MONTHS[i - 1] not in mon_dict:
-                                            mon_dict[MONTHS[i - 1]] = np.nan
-                                # 计算季节 ACC (按 SEASONS 顺序)
-                                seas_dict = {}
+                                        acc_entry['monthly'][m_name] = np.nan
+                                        acc_entry['monthly_p'][m_name] = np.nan
                                 for seas, m_idxs in SEASONS.items():
-                                    vals = [mon_dict.get(MONTHS[m - 1], np.nan) for m in m_idxs]
-                                    seas_dict[seas] = float(np.nanmean(vals))
-                                ann_val = float(np.nanmean([v for v in mon_dict.values() if np.isfinite(v)])) if mon_dict else np.nan
-
-                                data[lt]['acc'][model] = {
-                                    'monthly': mon_dict,
-                                    'seasonal': seas_dict,
-                                    'annual': ann_val
-                                }
+                                    vals = [acc_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
+                                    acc_entry['seasonal'][seas] = float(np.nanmean(vals))
+                                    acc_entry['seasonal_p'][seas] = np.nan 
+                                data[lt]['acc'][model] = acc_entry
                     except Exception as e:
-                        logger.warning(f"加载ACC失败 {region} {model}: {e}")
+                        pass
 
-                # 2. 加载 RMSE (from combined_error_analysis - 新版格式含 rmse_monthly 等)
+                # 2. 加载 RMSE
                 rmse_file = self.rmse_base_dir / f"{region}_{model}.nc"
+                rmse_entry = {'monthly': {}, 'seasonal': {}}
+                
                 if rmse_file.exists():
                     try:
                         with xr.open_dataset(rmse_file) as ds:
                             if int(lt) in ds.leadtime.values:
                                 ds_lt = ds.sel(leadtime=int(lt))
-                                mon_dict = {}
                                 if 'rmse_monthly' in ds_lt:
                                     da = ds_lt.rmse_monthly
-                                    month_coord = da.coords.get('month', None)
-                                    if month_coord is None:
-                                        month_coord = getattr(ds_lt, 'month', None)
-                                    months_iter = list(month_coord.values) if month_coord is not None else list(range(1, 13))
-                                    for m in months_iter:
-                                        m = int(m)
-                                        val = da.sel(month=m).values
-                                        mon_dict[MONTHS[m - 1]] = float(np.asarray(val).ravel()[0]) if val.size else np.nan
+                                    month_coord = da.coords.get('month', getattr(ds_lt, 'month', list(range(1, 13))))
+                                    for m in range(1, 13):
+                                        if m in month_coord:
+                                            val = da.sel(month=m).values
+                                            rmse_entry['monthly'][MONTHS[m-1]] = float(np.asarray(val).ravel()[0])
+                                        else:
+                                            rmse_entry['monthly'][MONTHS[m-1]] = np.nan
                                 else:
-                                    mon_dict = {MONTHS[i - 1]: np.nan for i in range(1, 13)}
+                                    for m in MONTHS: rmse_entry['monthly'][m] = np.nan
 
                                 if 'rmse_seasonal' in ds_lt and 'season' in ds_lt.dims:
-                                    seas_dict = {}
-                                    season_vals = np.asarray(ds_lt.season.values)
-                                    for s in list(SEASONS.keys()):
-                                        if np.any(season_vals == s):
+                                    for s in SEASONS.keys():
+                                        if s in ds_lt.season.values:
                                             val = ds_lt.rmse_seasonal.sel(season=s).values
-                                            seas_dict[s] = float(np.asarray(val).ravel()[0]) if np.asarray(val).size else np.nan
+                                            rmse_entry['seasonal'][s] = float(np.asarray(val).ravel()[0])
                                         else:
-                                            seas_dict[s] = np.nan
+                                            rmse_entry['seasonal'][s] = np.nan
                                 else:
-                                    # 从月度计算季节
-                                    seas_dict = {}
                                     for seas, m_idxs in SEASONS.items():
-                                        vals = [mon_dict.get(MONTHS[m - 1], np.nan) for m in m_idxs]
-                                        seas_dict[seas] = float(np.nanmean(vals))
-
-                                if 'rmse_annual' in ds_lt:
-                                    v = ds_lt.rmse_annual.values
-                                    ann_val = float(np.asarray(v).ravel()[0]) if np.asarray(v).size else np.nan
-                                else:
-                                    ann_val = float(np.nanmean(list(mon_dict.values()))) if mon_dict else np.nan
-
-                                data[lt]['rmse'][model] = {
-                                    'monthly': mon_dict,
-                                    'seasonal': seas_dict,
-                                    'annual': ann_val
-                                }
+                                        vals = [rmse_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
+                                        rmse_entry['seasonal'][seas] = float(np.nanmean(vals))
+                                
+                                data[lt]['rmse'][model] = rmse_entry
                     except Exception as e:
-                        logger.warning(f"加载RMSE失败 {region} {model}: {e}")
+                        pass
         return data
 
-    def plot_heatmap(self, region: str, leadtime: int, data: Dict, mode: str = 'monthly'):
-        """绘制热图 (Month x Model 或 Season/Annual x Model)"""
-
-        rmse_data_all = data[leadtime]['rmse']
-        acc_data_all = data[leadtime]['acc']
-
-        models = [m for m in MODEL_LIST if m in rmse_data_all or m in acc_data_all]
-        if not models:
-            return
-
-        if mode == 'monthly':
-            y_labels = MONTHS
-            rows = 12
+    def _get_levels_and_cmap(self, all_vals, vtype='rmse'):
+        """
+        获取 colorbar 配置，修复 bin 数量问题
+        """
+        if vtype == 'rmse':
+            valid = [x for x in all_vals if np.isfinite(x) and x >= 0]
+            vmin = 0
+            vmax = np.nanmax(valid) if valid else 1.0
+            if vmax > 5: vmax = np.ceil(vmax)
+            else: vmax = np.ceil(vmax * 10) / 10
+            
+            levels = np.linspace(vmin, vmax, N_RMSE_LEVELS)
+            n_bins = len(levels) - 1
+            # extend='max' 需要 n_bins + 1 个颜色
+            n_colors = n_bins + 1
+            
+            if self.var_type == 'temp': cmap = plt.get_cmap('Reds', n_colors)
+            else: cmap = plt.get_cmap('Blues', n_colors)
+            norm = BoundaryNorm(levels, n_colors, extend='max')
+            return norm, cmap, levels
         else:
-            y_labels = ['Annual'] + list(SEASONS.keys())
-            rows = 5
+            vmin, vmax = -1.0, 1.0
+            levels = np.linspace(vmin, vmax, N_ACC_LEVELS)
+            n_bins = len(levels) - 1
+            # extend='both' 需要 n_bins + 2 个颜色
+            n_colors = n_bins + 2 
+            
+            cmap = plt.get_cmap('coolwarm', n_colors)
+            norm = BoundaryNorm(levels, n_colors, extend='both')
+            return norm, cmap, levels
 
+    def _plot_single_heatmap(self, ax, data_dict, models, mode, metric, norm, cmap, levels, 
+                             show_xticklabels=True, show_yticklabels=True):
+        y_labels = MONTHS if mode == 'monthly' else list(SEASONS.keys())
+        rows = len(y_labels)
         cols = len(models)
-        fig, ax = plt.subplots(figsize=(max(6, cols), max(5, rows * 0.8)))
-
-        all_rmse = []
-        all_acc = []
-
-        for m in models:
-            r_dict = rmse_data_all.get(m, {})
-            a_dict = acc_data_all.get(m, {})
-
-            if mode == 'monthly':
-                vals_r = list(r_dict.get('monthly', {}).values())
-                vals_a = list(a_dict.get('monthly', {}).values())
-            else:
-                vals_r = [r_dict.get('annual', np.nan)] + [r_dict.get('seasonal', {}).get(s, np.nan) for s in SEASONS.keys()]
-                vals_a = [a_dict.get('annual', np.nan)] + [a_dict.get('seasonal', {}).get(s, np.nan) for s in SEASONS.keys()]
-
-            all_rmse.extend(vals_r)
-            all_acc.extend(vals_a)
-
-        # RMSE: 从 0 开始，温度 Reds、降水 Blues；分段 colorbar，extend='max'
-        rmse_vmin = 0
-        valid_rmse = [x for x in all_rmse if np.isfinite(x) and x >= 0]
-        rmse_vmax = np.nanmax(valid_rmse) if valid_rmse else 1.0
-        rmse_levels = np.linspace(rmse_vmin, rmse_vmax, N_RMSE_LEVELS)
-        n_rmse_colors = (N_RMSE_LEVELS - 1) + 1   # 分段数 + extend='max' 的 1 个三角
-        if self.var_type == 'temp':
-            rmse_cmap = plt.get_cmap('Reds', n_rmse_colors)
-        else:
-            rmse_cmap = plt.get_cmap('Blues', n_rmse_colors)
-        rmse_norm = BoundaryNorm(rmse_levels, n_rmse_colors, extend='max')
-
-        # ACC: -1 到 1，红蓝渐变 coolwarm；分段 colorbar，extend='both'
-        acc_vmin, acc_vmax = -1.0, 1.0
-        acc_levels = np.linspace(acc_vmin, acc_vmax, N_ACC_LEVELS)
-        n_acc_colors = (N_ACC_LEVELS - 1) + 2   # 分段数 + extend='both' 的 2 个三角
-        acc_cmap = plt.get_cmap('coolwarm', n_acc_colors)
-        acc_norm = BoundaryNorm(acc_levels, n_acc_colors, extend='both')
-
-        for i, row_label in enumerate(y_labels):
-            for j, model in enumerate(models):
-                r_val = np.nan
-                a_val = np.nan
-
-                r_d = rmse_data_all.get(model, {})
-                a_d = acc_data_all.get(model, {})
-
-                if mode == 'monthly':
-                    r_val = r_d.get('monthly', {}).get(row_label, np.nan)
-                    a_val = a_d.get('monthly', {}).get(row_label, np.nan)
-                else:
-                    if row_label == 'Annual':
-                        r_val = r_d.get('annual', np.nan)
-                        a_val = a_d.get('annual', np.nan)
-                    else:
-                        r_val = r_d.get('seasonal', {}).get(row_label, np.nan)
-                        a_val = a_d.get('seasonal', {}).get(row_label, np.nan)
-
-                # RMSE (左上三角)：从 0 起，分段着色
-                if not np.isnan(r_val) and np.isfinite(r_val):
-                    r_val_clip = max(rmse_vmin, min(r_val, rmse_levels[-1])) if len(rmse_levels) > 1 else r_val
-                    idx_r = rmse_norm(r_val_clip)
-                    idx_r = int(np.clip(idx_r, 0, n_rmse_colors - 1))
-                    color_r = rmse_cmap(idx_r / max(1, n_rmse_colors - 1))
-                    poly_r = patches.Polygon([(j, i), (j, i + 1), (j + 1, i + 1)], facecolor=color_r, edgecolor='none')
-                    ax.add_patch(poly_r)
-                    tc = 'white' if sum(color_r[:3]) / 3 < 0.5 else 'black'
-                    ax.text(j + 0.3, i + 0.7, f"{r_val:.2f}", color=tc, fontsize=7, ha='center', va='center')
-
-                # ACC (右下三角)：-1 到 1，分段着色
-                if not np.isnan(a_val) and np.isfinite(a_val):
-                    a_val_clip = max(acc_vmin, min(a_val, acc_vmax))
-                    idx_a = acc_norm(a_val_clip)
-                    idx_a = int(np.clip(idx_a, 0, n_acc_colors - 1))
-                    color_a = acc_cmap(idx_a / max(1, n_acc_colors - 1))
-                    poly_a = patches.Polygon([(j, i), (j + 1, i), (j + 1, i + 1)], facecolor=color_a, edgecolor='none')
-                    ax.add_patch(poly_a)
-                    tc = 'white' if sum(color_a[:3]) / 3 < 0.5 else 'black'
-                    ax.text(j + 0.7, i + 0.3, f"{a_val:.2f}", color=tc, fontsize=7, ha='center', va='center')
-
+        
         ax.set_xlim(0, cols)
         ax.set_ylim(0, rows)
-        ax.set_xticks(np.arange(cols) + 0.5)
-        ax.set_xticklabels([m.replace('-mon', '') for m in models], rotation=45, ha='right')
-        ax.set_yticks(np.arange(rows) + 0.5)
-        ax.set_yticklabels(y_labels)
         ax.invert_yaxis()
-
+        
+        # 网格线
         for x in range(cols + 1):
             ax.axvline(x, color='k', lw=0.5)
         for y in range(rows + 1):
             ax.axhline(y, color='k', lw=0.5)
-        if mode != 'monthly':
-            ax.axhline(1, color='k', lw=2)
+            
+        for i, row_label in enumerate(y_labels):
+            for j, model in enumerate(models):
+                entry = data_dict.get(model, {})
+                val = np.nan
+                p_val = np.nan
+                
+                if metric == 'rmse':
+                    val = entry.get(mode, {}).get(row_label, np.nan)
+                else: 
+                    val = entry.get(mode, {}).get(row_label, np.nan)
+                    if mode == 'monthly':
+                        p_val = entry.get('monthly_p', {}).get(row_label, np.nan)
+                    else:
+                        p_val = entry.get('seasonal_p', {}).get(row_label, np.nan)
 
-        ax.set_title(f"{region} {self.var_type.upper()} Metrics (L{leadtime}) - {mode.title()}")
+                if np.isfinite(val):
+                    if metric == 'rmse':
+                        val_clip = max(levels[0], min(val, levels[-1]))
+                    else:
+                        val_clip = max(-1, min(val, 1))
+                    
+                    color = cmap(norm(val_clip))
+                    rect = patches.Rectangle((j, i), 1, 1, facecolor=color, edgecolor='none')
+                    ax.add_patch(rect)
+                    
+                    # 增大打点 s=25
+                    if metric == 'acc' and np.isfinite(p_val) and p_val < 0.05:
+                        ax.scatter(j + 0.5, i + 0.5, s=25, c='black', marker='o', linewidths=0)
 
-        cax1 = fig.add_axes([0.92, 0.55, 0.02, 0.3])
-        sm1 = ScalarMappable(norm=rmse_norm, cmap=rmse_cmap)
-        sm1.set_array([])
-        cb1 = plt.colorbar(sm1, cax=cax1, extend='max', ticks=rmse_levels)
-        cb1.set_label('RMSE')
+        # 轴标签处理
+        ax.set_xticks(np.arange(cols) + 0.5)
+        if show_xticklabels:
+            ax.set_xticklabels([m.replace('-mon', '').replace('Meteo-France', 'MF') for m in models], 
+                               rotation=45, ha='right', fontsize=10)
+        else:
+            ax.set_xticklabels([])
+            
+        ax.set_yticks(np.arange(rows) + 0.5)
+        if show_yticklabels:
+            ax.set_yticklabels(y_labels, fontsize=10)
+        else:
+            ax.set_yticklabels([])
+            
+        ax.tick_params(axis='both', which='both', length=0)
 
-        cax2 = fig.add_axes([0.92, 0.15, 0.02, 0.3])
-        sm2 = ScalarMappable(norm=acc_norm, cmap=acc_cmap)
-        sm2.set_array([])
-        cb2 = plt.colorbar(sm2, cax=cax2, extend='both', ticks=acc_levels)
-        cb2.set_label('ACC')
+    def plot_global_figure(self, leadtime: int, global_data: Dict):
+        models = [m for m in MODEL_LIST if m in global_data['rmse']]
+        if not models: return
 
-        fname = f"{region.replace(' ', '_')}_{mode}_L{leadtime}.png"
+        # Global 图 14x12
+        fig = plt.figure(figsize=(14, 12))
+        # 紧凑间距
+        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.08, wspace=0.08)
+        
+        rmse_vals = []
+        acc_vals = []
+        for m in models:
+            rmse_vals.extend(global_data['rmse'][m].get('monthly', {}).values())
+            rmse_vals.extend(global_data['rmse'][m].get('seasonal', {}).values())
+            acc_vals.extend(global_data['acc'][m].get('monthly', {}).values())
+            acc_vals.extend(global_data['acc'][m].get('seasonal', {}).values())
+            
+        norm_r, cmap_r, levels_r = self._get_levels_and_cmap(rmse_vals, 'rmse')
+        norm_a, cmap_a, levels_a = self._get_levels_and_cmap(acc_vals, 'acc')
+        
+        layouts = [
+            (0, 0, 'monthly', 'rmse', norm_r, cmap_r, levels_r),
+            (0, 1, 'monthly', 'acc', norm_a, cmap_a, levels_a),
+            (1, 0, 'seasonal', 'rmse', norm_r, cmap_r, levels_r),
+            (1, 1, 'seasonal', 'acc', norm_a, cmap_a, levels_a)
+        ]
+        
+        for r, c, mode, metric, norm, cmap, levels in layouts:
+            ax = fig.add_subplot(gs[r, c])
+            # Global图: 底部行显示X轴，左侧列显示Y轴
+            show_x = (r == 1)
+            show_y = (c == 0)
+            
+            self._plot_single_heatmap(ax, global_data[metric], models, mode, metric, norm, cmap, levels, 
+                                      show_xticklabels=show_x, show_yticklabels=show_y)
+            # 无标题
+            
+        # Colorbars
+        cax_r = fig.add_axes([0.15, 0.05, 0.3, 0.02])
+        cb_r = plt.colorbar(ScalarMappable(norm=norm_r, cmap=cmap_r), cax=cax_r, orientation='horizontal', extend='max')
+        cb_r.set_ticks(levels_r)
+        cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        cb_r.set_label('RMSE', fontsize=12)
+        
+        cax_a = fig.add_axes([0.55, 0.05, 0.3, 0.02])
+        cb_a = plt.colorbar(ScalarMappable(norm=norm_a, cmap=cmap_a), cax=cax_a, orientation='horizontal', extend='both')
+        cb_a.set_ticks(levels_a)
+        cb_a.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        cb_a.set_label('ACC', fontsize=12)
+        
+        fname = f"Global_{self.var_type}_L{leadtime}.png"
+        plt.savefig(self.output_dir / fname, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved {fname}")
+
+    def plot_regions_figure(self, leadtime: int, regions_data: Dict[str, Dict]):
+        models = MODEL_LIST
+        
+        all_rmse = []
+        all_acc = []
+        for reg_d in regions_data.values():
+            for m in models:
+                if m in reg_d['rmse']:
+                    all_rmse.extend(reg_d['rmse'][m].get('monthly', {}).values())
+                    all_rmse.extend(reg_d['rmse'][m].get('seasonal', {}).values())
+                if m in reg_d['acc']:
+                    all_acc.extend(reg_d['acc'][m].get('monthly', {}).values())
+                    all_acc.extend(reg_d['acc'][m].get('seasonal', {}).values())
+        
+        norm_r, cmap_r, levels_r = self._get_levels_and_cmap(all_rmse, 'rmse')
+        norm_a, cmap_a, levels_a = self._get_levels_and_cmap(all_acc, 'acc')
+
+        # 区域大图 26x22
+        fig = plt.figure(figsize=(26, 22))
+        
+        # 4大块布局，紧凑
+        outer_gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.1, wspace=0.08, height_ratios=[1, 0.4]) 
+        
+        quadrants = [
+            (0, 0, 'monthly', 'rmse', norm_r, cmap_r, levels_r),
+            (0, 1, 'monthly', 'acc', norm_a, cmap_a, levels_a),
+            (1, 0, 'seasonal', 'rmse', norm_r, cmap_r, levels_r),
+            (1, 1, 'seasonal', 'acc', norm_a, cmap_a, levels_a)
+        ]
+
+        region_grid = [
+            ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast'],
+            ['Z4-Tibetan',   'Z5-NorthChina',    'Z7-Yangtze'],
+            ['Z6-Southwest', 'Z8-SouthChina',    'Z9-SouthSea']
+        ]
+
+        for qr, qc, mode, metric, norm, cmap, levels in quadrants:
+            # 内部3x3小图布局，极度紧凑
+            inner_gs = gridspec.GridSpecFromSubplotSpec(3, 3, subplot_spec=outer_gs[qr, qc], 
+                                                        hspace=0.2, wspace=0.05)
+            
+            for r in range(3):
+                for c in range(3):
+                    reg_name = region_grid[r][c]
+                    ax = fig.add_subplot(inner_gs[r, c])
+                    
+                    data_to_plot = regions_data.get(reg_name, {}).get(metric, {})
+                    
+                    # 仅在最底部的行 (row=2) 显示 X轴标签
+                    show_x = (r == 2)
+                    # 仅在最左侧的列 (col=0) 显示 Y轴标签
+                    show_y = (c == 0)
+                    
+                    self._plot_single_heatmap(ax, data_to_plot, models, mode, metric, norm, cmap, levels,
+                                              show_xticklabels=show_x, show_yticklabels=show_y)
+                    
+                    # 仅保留 Z1~Z9 标注
+                    short_name = reg_name.split('-')[0] # Z1, Z2...
+                    ax.set_title(short_name, fontsize=11, pad=3, fontweight='bold')
+
+        # Colorbars
+        cax_r = fig.add_axes([0.15, 0.05, 0.3, 0.015])
+        cb_r = plt.colorbar(ScalarMappable(norm=norm_r, cmap=cmap_r), cax=cax_r, orientation='horizontal', extend='max')
+        cb_r.set_ticks(levels_r)
+        cb_r.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        cb_r.set_label('RMSE', fontsize=14)
+        
+        cax_a = fig.add_axes([0.55, 0.05, 0.3, 0.015])
+        cb_a = plt.colorbar(ScalarMappable(norm=norm_a, cmap=cmap_a), cax=cax_a, orientation='horizontal', extend='both')
+        cb_a.set_ticks(levels_a)
+        cb_a.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        cb_a.set_label('ACC', fontsize=14)
+
+        fname = f"Regions_Combined_{self.var_type}_L{leadtime}.png"
         plt.savefig(self.output_dir / fname, dpi=300, bbox_inches='tight')
         plt.close()
         logger.info(f"Saved {fname}")
 
     def run(self):
-        for region in REGIONS_LIST:
-            logger.info(f"Processing region: {region}")
-            data = self.load_regional_data(region)
-            for lt in LEADTIMES:
-                if not data[lt]['rmse'] and not data[lt]['acc']:
-                    continue
-                self.plot_heatmap(region, lt, data, mode='monthly')
-                self.plot_heatmap(region, lt, data, mode='seasonal')
-
+        for lt in LEADTIMES:
+            logger.info(f"Processing Leadtime: {lt}")
+            global_data = self.load_regional_data(REGION_GLOBAL).get(lt, {})
+            if global_data:
+                self.plot_global_figure(lt, global_data)
+            
+            regions_data = {}
+            for region in REGIONS_Z:
+                r_data = self.load_regional_data(region).get(lt, {})
+                regions_data[region] = r_data
+            if regions_data:
+                self.plot_regions_figure(lt, regions_data)
 
 if __name__ == "__main__":
     for var in ['temp', 'prec']:
