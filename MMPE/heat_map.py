@@ -3,10 +3,8 @@
 """
 多区域三重指标(Bias, RMSE, ACC)组合热图绘制模块 (Fixed V10 - Robust Reading)
 功能升级：
-1. 增强数据读取鲁棒性：增加 _safe_get_value 函数，自动处理标量、0维数组或单维度数组，
-   防止因数据维度差异导致的读取错误。
-2. 优先读取预计算指标：对于 Seasonal 数据，优先读取 NetCDF 中的 _seasonal 变量，
-   确保与 combined_error_analysis.py 的精确计算保持一致。
+1. 增强数据读取鲁棒性：自动处理标量、0维数组或单维度数组。
+2. 同步适配 Ensemble Member 更新：显式读取 Ensemble Mean 变量，确保与新文件结构兼容。
 3. 保持特性：无 MAE，ECCC 别名，显著性打点。
 """
 
@@ -81,13 +79,13 @@ class RegionalHeatMapPlotter:
             if np.ndim(vals) == 0:
                 return float(vals.item())
             
-            # 如果仍然是数组（理论上不应发生，除非 selector 选了多个点），取均值作为兜底
+            # 如果是 (number, ) 或类似数组，取均值（兜底策略）
             return float(np.nanmean(vals))
         except Exception:
             return np.nan
 
     def load_regional_data(self, region: str) -> Dict:
-        """加载数据 (Bias, RMSE, ACC)"""
+        """加载数据 (Bias, RMSE, ACC) - 读取 Ensemble Mean"""
         data = {}
         safe_region = region.replace(' ', '_')
 
@@ -105,7 +103,7 @@ class RegionalHeatMapPlotter:
                             if int(lt) in ds.leadtime.values:
                                 ds_lt = ds.sel(leadtime=int(lt))
                                 
-                                # --- Monthly ACC ---
+                                # --- Monthly ACC (Read standard variable) ---
                                 if 'regional_index_acc' in ds_lt:
                                     da_acc = ds_lt['regional_index_acc']
                                     da_p = ds_lt.get('p_value')
@@ -157,13 +155,11 @@ class RegionalHeatMapPlotter:
                                 ds_lt = ds.sel(leadtime=int(lt))
                                 
                                 def extract_metric(ds_subset, metric_prefix, target_entry):
-                                    # Monthly
+                                    # Monthly (Ens Mean)
                                     var_mon = f"{metric_prefix}_monthly"
                                     if var_mon in ds_subset:
                                         da = ds_subset[var_mon]
-                                        # 使用 _safe_get_value 安全提取
                                         for m in range(1, 13):
-                                            # 检查月份是否存在于坐标中
                                             if 'month' in da.coords and m in da.month.values:
                                                 target_entry['monthly'][MONTHS[m-1]] = self._safe_get_value(da, {'month': m})
                                             else:
@@ -171,7 +167,7 @@ class RegionalHeatMapPlotter:
                                     else:
                                         for m in MONTHS: target_entry['monthly'][m] = np.nan
 
-                                    # Seasonal (优先读取预计算的)
+                                    # Seasonal (Ens Mean)
                                     var_seas = f"{metric_prefix}_seasonal"
                                     if var_seas in ds_subset and 'season' in ds_subset.dims:
                                         da_seas = ds_subset[var_seas]

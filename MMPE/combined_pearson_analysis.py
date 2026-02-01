@@ -5,8 +5,9 @@
 计算各个模式与观测的年度、季节、月度空间平均Pearson相关系数
 
 修改：
-1. calculate_regional_index_acc: 增加季节平均的 ACC (Anomaly Correlation of Seasonal Means) 计算与显著性检验。
-   结果变量: 'regional_index_acc_seasonal' (season) 和 'p_value_seasonal' (season)。
+1. 增加 Ensemble Member 维度的 ACC 计算。
+2. 绘图增加所有模式所有成员的 Spread 阴影。
+3. 保存时增加 member 维度的变量。
 """
 
 import sys
@@ -170,7 +171,7 @@ class SeasonalMonthlyPearsonAnalyzer:
         self.boundaries_dir = Path(__file__).parent.parent / "boundaries"
        
     def get_anomalies(self, obs_data: xr.DataArray, fcst_data: xr.DataArray, leadtime: int) -> Tuple[xr.DataArray, xr.DataArray]:
-        """计算逐格点月距平场"""
+        """计算逐格点月距平场 (支持 ensemble members)"""
         try:
             # 确保时间坐标是 datetime 类型
             if not np.issubdtype(obs_data.time.dtype, np.datetime64):
@@ -178,13 +179,16 @@ class SeasonalMonthlyPearsonAnalyzer:
             if not np.issubdtype(fcst_data.time.dtype, np.datetime64):
                 fcst_data['time'] = pd.to_datetime(fcst_data.time.values)
 
-            # 观测的气候态：按月份计算 (1-12月)
+            # 观测的气候态
             obs_clim = obs_data.groupby('time.month').mean('time')
-            
-            # 模式的气候态：必须针对特定的 leadtime 计算
-            fcst_clim = fcst_data.groupby('time.month').mean('time')
-            
             obs_anom = obs_data.groupby('time.month') - obs_clim
+            
+            # 模式的气候态
+            # 如果 fcst_data 有 'number' 维度，groupby('time.month').mean('time') 会对每个 member 计算气候态
+            # 或者，我们可以使用 ensemble mean 的气候态？
+            # 这里的做法是：每个 member 减去该 member 自己的气候态 (或者 ensemble mean 的气候态)。
+            # 通常 ACC 计算中，每个 member 减去其自身的气候态是比较标准的做法。
+            fcst_clim = fcst_data.groupby('time.month').mean('time')
             fcst_anom = fcst_data.groupby('time.month') - fcst_clim
             
             return obs_anom, fcst_anom
@@ -195,10 +199,15 @@ class SeasonalMonthlyPearsonAnalyzer:
     def calculate_temporal_acc_monthly_mean(self, obs_anom: xr.DataArray, fcst_anom: xr.DataArray) -> xr.Dataset:
         """
         计算逐月平均的逐格点时间异常相关系数 (Mean Temporal ACC) 及其显著性
-        返回 Dataset {'temporal_acc_mean': ..., 'p_value': ...}
+        注：此函数用于空间分布的平均统计，目前仅计算 Ensemble Mean 的 ACC。
         """
         try:
-            # 定义权重
+            # 如果有 number 维度，先求 Ensemble Mean 用于此计算 (Map相关)
+            if 'number' in fcst_anom.dims:
+                fcst_input = fcst_anom.mean(dim='number')
+            else:
+                fcst_input = fcst_anom
+
             weights = np.cos(np.deg2rad(obs_anom.lat))
             
             monthly_means = []
@@ -206,9 +215,8 @@ class SeasonalMonthlyPearsonAnalyzer:
             months = list(range(1, 13))
             
             for month in months:
-                # 提取该月的数据 (所有年份)
                 obs_m = obs_anom.sel(time=obs_anom.time.dt.month == month)
-                fcst_m = fcst_anom.sel(time=fcst_anom.time.dt.month == month)
+                fcst_m = fcst_input.sel(time=fcst_input.time.dt.month == month)
                 
                 n_samples = obs_m.sizes['time']
                 
@@ -217,7 +225,6 @@ class SeasonalMonthlyPearsonAnalyzer:
                     monthly_p_values.append(np.nan)
                     continue
                     
-                # 计算逐格点时间相关系数 (lat, lon) - 仅需 r
                 tcc_map = xr.apply_ufunc(
                     pearson_r_along_time,
                     obs_m, fcst_m,
@@ -227,12 +234,9 @@ class SeasonalMonthlyPearsonAnalyzer:
                     dask='parallelized'
                 )
                 
-                # 计算空间加权平均
                 mean_tcc = tcc_map.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
                 mean_val = float(mean_tcc.item())
                 monthly_means.append(mean_val)
-                
-                # 基于 Mean TCC 和样本量 N 计算 p-value
                 p_val = calculate_p_value_from_r(mean_val, n_samples)
                 monthly_p_values.append(p_val)
                 
@@ -250,13 +254,18 @@ class SeasonalMonthlyPearsonAnalyzer:
 
     def calculate_temporal_acc_map(self, obs_anom: xr.DataArray, fcst_anom: xr.DataArray) -> xr.Dataset:
         """
-        计算逐格点的“全逐月时间序列”异常相关系数（Temporal ACC）及显著性。
+        计算逐格点的“全逐月时间序列”异常相关系数。仅计算 Ensemble Mean。
         """
         try:
+            if 'number' in fcst_anom.dims:
+                fcst_input = fcst_anom.mean(dim='number')
+            else:
+                fcst_input = fcst_anom
+
             res = xr.apply_ufunc(
                 pearson_r_along_time_with_p,
                 obs_anom,
-                fcst_anom,
+                fcst_input,
                 input_core_dims=[['time'], ['time']],
                 output_core_dims=[[], []],
                 vectorize=True,
@@ -273,7 +282,7 @@ class SeasonalMonthlyPearsonAnalyzer:
                 'temporal_acc': r_da,
                 'p_value': p_da
             })
-            ds['temporal_acc'].attrs = {"long_name": "Temporal Anomaly Correlation Coefficient", "units": "1"}
+            ds['temporal_acc'].attrs = {"long_name": "Temporal ACC (Ensemble Mean)", "units": "1"}
             ds['significant'] = ds['p_value'] < 0.05
             
             return ds
@@ -284,18 +293,10 @@ class SeasonalMonthlyPearsonAnalyzer:
     def calculate_regional_index_acc(self, obs_anom: xr.DataArray, fcst_anom: xr.DataArray, 
                                      region_bounds: Optional[Dict]) -> xr.Dataset:
         """
-        计算区域平均后的指数相关系数 (Regional Index ACC)
-        包括：
-        1. Monthly ACC: 月平均时间序列的相关
-        2. Seasonal ACC: 季节平均时间序列的相关 (Anomaly Correlation of Seasonal Means)
-        
-        Args:
-            obs_anom: 观测异常场 (time, lat, lon)
-            fcst_anom: 模式异常场 (time, lat, lon)
-            region_bounds: 区域边界
-        
-        Returns:
-            xr.Dataset 包含月度/季节 ACC 和 p-value
+        计算区域平均后的指数相关系数 (Regional Index ACC)。
+        同时计算：
+        1. Ensemble Mean ACC (deterministic skill)
+        2. Individual Member ACC (probabilistic skill spread)
         """
         try:
             # 1. 区域截取
@@ -305,110 +306,110 @@ class SeasonalMonthlyPearsonAnalyzer:
             if region_bounds is not None:
                 lat_b = region_bounds['lat']
                 lon_b = region_bounds['lon']
-                
-                # 处理纬度可能的递减顺序
                 if obs_reg.lat[0] < obs_reg.lat[-1]:
                     lat_slice = slice(lat_b[0], lat_b[1])
                 else:
                     lat_slice = slice(lat_b[1], lat_b[0])
-                
                 obs_reg = obs_reg.sel(lat=lat_slice, lon=slice(lon_b[0], lon_b[1]))
                 fcst_reg = fcst_reg.sel(lat=lat_slice, lon=slice(lon_b[0], lon_b[1]))
             
-            # 2. 纬度加权空间平均（得到区域平均时间序列）
+            # 2. 纬度加权空间平均
             weights = np.cos(np.deg2rad(obs_reg.lat))
             weights.name = "weights"
             
             obs_ts = obs_reg.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
             fcst_ts = fcst_reg.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
             
-            # 3. 按月份计算相关系数 (Monthly)
+            # 分离 Ensemble Mean 和 Members
+            if 'number' in fcst_ts.dims:
+                fcst_ts_mean = fcst_ts.mean(dim='number')
+                fcst_ts_members = fcst_ts # (time, number)
+                members = fcst_ts.number.values
+            else:
+                fcst_ts_mean = fcst_ts
+                fcst_ts_members = None
+                members = []
+
+            # ---------------------------
+            # 计算 Ensemble Mean 的 ACC
+            # ---------------------------
             monthly_corrs = []
             monthly_p_values = []
-            months = list(range(1, 13))
-            
-            for month in months:
-                # 提取该月的所有年份数据
-                o = obs_ts.sel(time=obs_ts.time.dt.month == month).values
-                f = fcst_ts.sel(time=fcst_ts.time.dt.month == month).values
-                
-                # 移除 NaN
-                mask = np.isfinite(o) & np.isfinite(f)
-                o_valid = o[mask]
-                f_valid = f[mask]
-                
-                if len(o_valid) < 3:
-                    monthly_corrs.append(np.nan)
-                    monthly_p_values.append(np.nan)
-                    continue
-                
-                r, p = stats.pearsonr(o_valid, f_valid)
-                monthly_corrs.append(r)
-                monthly_p_values.append(p)
-
-            # 4. 按季节计算相关系数 (Seasonal) - 科学的季节平均相关
             seasonal_corrs = []
             seasonal_p_values = []
-            seasons_list = list(SEASONS.keys()) # ['DJF', 'MAM', 'JJA', 'SON']
             
-            for season in seasons_list:
-                month_idxs = SEASONS[season]
-                
-                # 获取属于该季节的数据
-                # 对于 DJF (12, 1, 2)，通常12月属于前一年，1,2月属于当年。
-                # 简单的做法：提取所有属于该季节月份的时间点，然后按年分组求平均
-                
-                # 标记 seasonal year
-                # DJF: Dec(year-1), Jan(year), Feb(year) -> season_year = year
-                # Shift time for DJF so Dec becomes next year
-                if season == 'DJF':
-                    # 将时间偏移一个月，使 12月 变成下一年的 1月，从而与 1,2月 同年
-                    obs_season_ts = obs_ts.shift(time=-1).dropna(dim='time')
-                    fcst_season_ts = fcst_ts.shift(time=-1).dropna(dim='time')
-                    # 此时 1993-12 变成了 1994-01 的位置（逻辑上），但这里我们更稳健的做法是：
-                    # 使用 groupby 自定义
-                    pass
+            months = list(range(1, 13))
+            seasons_list = list(SEASONS.keys())
 
-                # 通用方法：筛选月份 -> Resample/Groupby Year -> Mean
-                season_mask_obs = obs_ts.time.dt.month.isin(month_idxs)
-                obs_season_subset = obs_ts.sel(time=season_mask_obs)
+            def calc_acc_for_ts(o_ts, f_ts):
+                # Monthly
+                m_corrs, m_ps = [], []
+                for month in months:
+                    o = o_ts.sel(time=o_ts.time.dt.month == month).values
+                    f = f_ts.sel(time=f_ts.time.dt.month == month).values
+                    mask = np.isfinite(o) & np.isfinite(f)
+                    if np.sum(mask) < 3:
+                        m_corrs.append(np.nan); m_ps.append(np.nan)
+                    else:
+                        r, p = stats.pearsonr(o[mask], f[mask])
+                        m_corrs.append(r); m_ps.append(p)
                 
-                season_mask_fcst = fcst_ts.time.dt.month.isin(month_idxs)
-                fcst_season_subset = fcst_ts.sel(time=season_mask_fcst)
+                # Seasonal
+                s_corrs, s_ps = [], []
+                for season in seasons_list:
+                    month_idxs = SEASONS[season]
+                    season_mask_obs = o_ts.time.dt.month.isin(month_idxs)
+                    obs_season_subset = o_ts.sel(time=season_mask_obs)
+                    season_mask_fcst = f_ts.time.dt.month.isin(month_idxs)
+                    fcst_season_subset = f_ts.sel(time=season_mask_fcst)
 
-                # 处理跨年季节 (DJF)
-                if season == 'DJF':
-                    # 定义 season_year：1月2月保持不变，12月+1
-                    obs_sy = obs_season_subset.time.dt.year + (obs_season_subset.time.dt.month == 12)
-                    fcst_sy = fcst_season_subset.time.dt.year + (fcst_season_subset.time.dt.month == 12)
-                    
-                    obs_yearly = obs_season_subset.groupby(obs_sy.rename('year')).mean('time')
-                    fcst_yearly = fcst_season_subset.groupby(fcst_sy.rename('year')).mean('time')
-                else:
-                    # 非跨年，直接按年平均
-                    obs_yearly = obs_season_subset.groupby('time.year').mean('time')
-                    fcst_yearly = fcst_season_subset.groupby('time.year').mean('time')
-                
-                # 对齐年份
-                common_years = np.intersect1d(obs_yearly.year, fcst_yearly.year)
-                
-                if len(common_years) < 3:
-                    seasonal_corrs.append(np.nan)
-                    seasonal_p_values.append(np.nan)
-                    continue
+                    if season == 'DJF':
+                        obs_sy = obs_season_subset.time.dt.year + (obs_season_subset.time.dt.month == 12)
+                        fcst_sy = fcst_season_subset.time.dt.year + (fcst_season_subset.time.dt.month == 12)
+                        obs_yearly = obs_season_subset.groupby(obs_sy.rename('year')).mean('time')
+                        fcst_yearly = fcst_season_subset.groupby(fcst_sy.rename('year')).mean('time')
+                    else:
+                        obs_yearly = obs_season_subset.groupby('time.year').mean('time')
+                        fcst_yearly = fcst_season_subset.groupby('time.year').mean('time')
 
-                o_vec = obs_yearly.sel(year=common_years).values
-                f_vec = fcst_yearly.sel(year=common_years).values
-                
-                mask = np.isfinite(o_vec) & np.isfinite(f_vec)
-                if np.sum(mask) < 3:
-                    seasonal_corrs.append(np.nan)
-                    seasonal_p_values.append(np.nan)
-                else:
-                    r, p = stats.pearsonr(o_vec[mask], f_vec[mask])
-                    seasonal_corrs.append(r)
-                    seasonal_p_values.append(p)
-            
+                    common_years = np.intersect1d(obs_yearly.year, fcst_yearly.year)
+                    if len(common_years) < 3:
+                        s_corrs.append(np.nan); s_ps.append(np.nan)
+                    else:
+                        o_vec = obs_yearly.sel(year=common_years).values
+                        f_vec = fcst_yearly.sel(year=common_years).values
+                        mask = np.isfinite(o_vec) & np.isfinite(f_vec)
+                        if np.sum(mask) < 3:
+                            s_corrs.append(np.nan); s_ps.append(np.nan)
+                        else:
+                            r, p = stats.pearsonr(o_vec[mask], f_vec[mask])
+                            s_corrs.append(r); s_ps.append(p)
+                return m_corrs, m_ps, s_corrs, s_ps
+
+            # 计算 Mean 的 ACC
+            m_r, m_p, s_r, s_p = calc_acc_for_ts(obs_ts, fcst_ts_mean)
+            monthly_corrs, monthly_p_values = m_r, m_p
+            seasonal_corrs, seasonal_p_values = s_r, s_p
+
+            # ---------------------------
+            # 计算 Members 的 ACC
+            # ---------------------------
+            monthly_corrs_mem = [] # list of lists (n_members, n_months)
+            seasonal_corrs_mem = [] # list of lists (n_members, n_seasons)
+
+            if fcst_ts_members is not None:
+                for mem_idx in range(len(members)):
+                    # 提取单个 member 的时间序列
+                    mem_ts = fcst_ts_members.isel(number=mem_idx)
+                    mm_r, _, ss_r, _ = calc_acc_for_ts(obs_ts, mem_ts)
+                    monthly_corrs_mem.append(mm_r)
+                    seasonal_corrs_mem.append(ss_r)
+            else:
+                # 兼容无 members 的情况 (dummy dim)
+                monthly_corrs_mem = [monthly_corrs]
+                seasonal_corrs_mem = [seasonal_corrs]
+                members = [0]
+
             # 5. 创建结果数据集
             ds = xr.Dataset(
                 {
@@ -416,11 +417,17 @@ class SeasonalMonthlyPearsonAnalyzer:
                     'p_value': (['month'], monthly_p_values),
                     'regional_index_acc_seasonal': (['season'], seasonal_corrs),
                     'p_value_seasonal': (['season'], seasonal_p_values),
+                    
+                    # Member data
+                    'regional_index_acc_members': (['number', 'month'], monthly_corrs_mem),
+                    'regional_index_acc_seasonal_members': (['number', 'season'], seasonal_corrs_mem),
+                    
                     'significant': (['month'], [p < 0.05 for p in monthly_p_values])
                 },
                 coords={
                     'month': months,
-                    'season': seasons_list
+                    'season': seasons_list,
+                    'number': members
                 }
             )
             
@@ -433,22 +440,24 @@ class SeasonalMonthlyPearsonAnalyzer:
             return None
 
     def load_and_preprocess_data(self, model: str, leadtime: int) -> Tuple[xr.DataArray, xr.DataArray]:
-        """加载和预处理数据"""
+        """加载和预处理数据 (使用 Ensemble Loader)"""
         try:
             # 加载观测数据
             obs_data = self.data_loader.load_obs_data(self.var_type)
             obs_data = obs_data.resample(time='1MS').mean()
             obs_data = obs_data.sel(time=slice('1993', '2020'))
             
-            # 加载模型数据
-            fcst_data = self.data_loader.load_forecast_data(model, self.var_type, leadtime)
+            # 加载模型数据 (Ensemble)
+            # 使用 load_forecast_data_ensemble 替代 load_forecast_data
+            fcst_data = self.data_loader.load_forecast_data_ensemble(model, self.var_type, leadtime)
+            
             if fcst_data is None:
                 return None, None
                 
             fcst_data = fcst_data.resample(time='1MS').mean()
             fcst_data = fcst_data.sel(time=slice('1993', '2020'))
             
-            # 时间对齐 (使用目标月份进行对齐)
+            # 时间对齐
             common_times = obs_data.time.to_index().intersection(fcst_data.time.to_index())
             if len(common_times) < 12:
                 logger.warning(f"时间对齐失败: {model} L{leadtime}, 共同时间点不足")
@@ -475,49 +484,36 @@ class SeasonalMonthlyPearsonAnalyzer:
             return None, None
     
     def calculate_annual_correlations(self, obs_data: xr.DataArray, fcst_data: xr.DataArray) -> Dict[int, float]:
-        """计算年度的相关系数"""
         return {}
     
     def calculate_seasonal_correlations(self, obs_data: xr.DataArray, fcst_data: xr.DataArray) -> Dict[str, float]:
-        """计算各季节的相关系数 (旧版，仅用于 CSV 输出)"""
         return {}
     
     def calculate_monthly_correlations(self, obs_data: xr.DataArray, fcst_data: xr.DataArray) -> Dict[str, float]:
-        """计算各月份的相关系数 (旧版，仅用于 CSV 输出)"""
         return {}
     
     def calculate_interannual_correlation(self, obs_data: xr.DataArray, fcst_data: xr.DataArray,
                                           use_anomaly: bool = True) -> float:
-        """计算加权后的年际相关系数"""
         return np.nan
 
     def add_china_map_details(self, ax, data, lon, lat, levels, cmap, draw_scs=True):
-        """添加中国国界线、河流、海岸线和南海子图"""
-        # 指定需要加载的国界线文件列表
+        # ... (保持原有代码不变)
         bou_paths = [
             Path("/sas12t1/ffyan/boundaries/中国_省1.shp"),
             Path("/sas12t1/ffyan/boundaries/中国_省2.shp")
         ]
-        
-        # 河流路径
         hyd_path = self.boundaries_dir / "河流.shp"
-        
-        # --- 1. 绘制河流 ---
         if hyd_path.exists():
             try:
                 reader = shpreader.Reader(str(hyd_path))
                 ax.add_geometries(reader.geometries(), ccrs.PlateCarree(),
                                 edgecolor='blue', facecolor='none', 
                                 linewidth=0.6, alpha=0.6, zorder=5)
-            except Exception as e:
+            except Exception:
                 ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
         else:
             ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6, zorder=5)
-        
-        # --- 2. 绘制海岸线 ---
         ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor='black', zorder=50)
-        
-        # --- 3. 绘制国界线 ---
         loaded_borders = False
         for bou_path in bou_paths:
             if bou_path.exists():
@@ -530,25 +526,19 @@ class SeasonalMonthlyPearsonAnalyzer:
                     loaded_borders = True
                 except Exception:
                     pass
-        
         if not loaded_borders:
             ax.add_feature(cfeature.BORDERS, linewidth=1.0, zorder=100)
-        
-        # --- 4. 绘制南海子图 ---
         if draw_scs:
             try:
-                # 位置参数：[x, y, width, height] (相对于父ax的坐标 0-1)
                 scs_width = 0.33
                 scs_height = 0.35
                 sub_ax = ax.inset_axes([0.7548, 0, scs_width, scs_height], 
                                       projection=ccrs.PlateCarree())
-                
                 sub_ax.patch.set_facecolor('white')
                 sub_ax.set_extent([105, 125, 0, 25], crs=ccrs.PlateCarree())
                 sub_ax.contourf(lon, lat, data, transform=ccrs.PlateCarree(),
                                cmap=cmap, levels=levels, extend='both')
                 sub_ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor='gray', zorder=50)
-                
                 if loaded_borders:
                     for bou_path in bou_paths:
                         if bou_path.exists():
@@ -560,23 +550,19 @@ class SeasonalMonthlyPearsonAnalyzer:
                                                     linewidth=0.6, zorder=100)
                             except Exception:
                                 pass
-                
                 sub_ax.tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
                 for spine in sub_ax.spines.values():
                     spine.set_edgecolor('black')
                     spine.set_linewidth(1.0)
-                    
             except Exception as e:
                 logger.warning(f"南海子图绘制失败: {e}")
     
     def analyze_all_models_leadtimes(self, models: List[str] = None, leadtimes: List[int] = None) -> Dict:
-        """分析所有模式和提前期"""
-        if models is None:
-            models = MODELS
-        if leadtimes is None:
-            leadtimes = LEADTIMES
+        # ... (保持原有逻辑，内部调用已更新的 load_and_preprocess_data)
+        if models is None: models = MODELS
+        if leadtimes is None: leadtimes = LEADTIMES
         
-        logger.info(f"开始{self.var_type}的Pearson分析")
+        logger.info(f"开始{self.var_type}的Pearson分析 (含 Ensemble Members)")
         
         results = {}
         model_spatial_acc_data = {model: [] for model in models}
@@ -585,21 +571,14 @@ class SeasonalMonthlyPearsonAnalyzer:
         
         for leadtime in leadtimes:
             logger.info(f"处理预报时效: L{leadtime}")
-            
-            annual_data = {}
-            annual_interannual = {}
-            seasonal_data = {}
-            monthly_data = {}
-            
+            annual_data = {}; annual_interannual = {}; seasonal_data = {}; monthly_data = {}
             for model in models:
-                # logger.info(f"处理模型: {model}")
-                
                 obs_data, fcst_data = self.load_and_preprocess_data(model, leadtime)
-                if obs_data is None or fcst_data is None:
-                    continue
+                if obs_data is None or fcst_data is None: continue
                 
                 obs_anom_field, fcst_anom_field = self.get_anomalies(obs_data, fcst_data, leadtime)
                 if obs_anom_field is not None and fcst_anom_field is not None:
+                    # Map 和 Global Mean ACC 仍基于 Ensemble Mean 计算，避免数据量过大
                     acc_map = self.calculate_temporal_acc_map(obs_anom_field, fcst_anom_field)
                     if acc_map is not None:
                         model_temporal_acc_maps[model][int(leadtime)] = acc_map
@@ -609,29 +588,20 @@ class SeasonalMonthlyPearsonAnalyzer:
                         acc_monthly = acc_monthly.expand_dims(leadtime=[leadtime])
                         model_spatial_acc_data[model].append(acc_monthly)
                     
-                    # === 计算各区域的 Index ACC (包含新的季节性计算) ===
+                    # 区域 ACC (含 Member 计算)
                     for reg_name, reg_bounds in REGIONS.items():
                         reg_acc_ds = self.calculate_regional_index_acc(obs_anom_field, fcst_anom_field, reg_bounds)
                         if reg_acc_ds is not None:
                             reg_acc_ds = reg_acc_ds.expand_dims(leadtime=[leadtime])
                             region_spatial_acc_data[reg_name][model].append(reg_acc_ds)
 
-                # 其他指标计算 (保持为空或原有逻辑)
-                annual_data[model] = {}
-                annual_interannual[model] = np.nan
-                seasonal_data[model] = {}
-                monthly_data[model] = {}
+                annual_data[model] = {}; annual_interannual[model] = np.nan
+                seasonal_data[model] = {}; monthly_data[model] = {}
                 
-            results[leadtime] = {
-                'annual': annual_data,
-                'annual_interannual': annual_interannual,
-                'seasonal': seasonal_data,
-                'monthly': monthly_data
-            }
+            results[leadtime] = {'annual': annual_data, 'annual_interannual': annual_interannual, 'seasonal': seasonal_data, 'monthly': monthly_data}
         
         self.save_spatial_acc_to_nc(model_spatial_acc_data)
         self.save_temporal_acc_maps_to_nc(model_temporal_acc_maps)
-        # 保存包含季节性显著性的新数据
         self.save_region_index_acc_to_nc(region_spatial_acc_data)
         
         self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
@@ -642,97 +612,74 @@ class SeasonalMonthlyPearsonAnalyzer:
         return results
 
     def plot_acc_spatial_maps(self, model_temporal_acc_maps: Dict[str, Dict[int, xr.Dataset]]):
-        """绘制ACC空间分布图 (Lead 0 和 Lead 3)"""
+        # ... (保持不变)
         try:
             plot_models = list(model_temporal_acc_maps.keys())
             leadtimes = [0, 3]
-            
             if not plot_models: return
-            
-            lon_range = (70, 140)
-            lat_range = (15, 55)
-            vmin, vmax = -1, 1
-            cmap = 'RdBu_r'
-            n_levels = 20
-            levels = np.linspace(vmin, vmax, n_levels + 1)
-            
+            lon_range = (70, 140); lat_range = (15, 55)
+            vmin, vmax = -1, 1; cmap = 'RdBu_r'
+            n_levels = 20; levels = np.linspace(vmin, vmax, n_levels + 1)
             fig = plt.figure(figsize=(20, 12))
             gs = GridSpec(4, 4, figure=fig, hspace=0.25, wspace=0.15, left=0.05, right=0.92, top=0.94, bottom=0.06)
-            
-            lon_ticks = np.arange(75, 141, 15)
-            lat_ticks = np.arange(20, 56, 10)
-            
+            lon_ticks = np.arange(75, 141, 15); lat_ticks = np.arange(20, 56, 10)
             for lt_idx, leadtime in enumerate(leadtimes):
                 row_start = lt_idx * 2
                 ax_blank = fig.add_subplot(gs[row_start, 0]); ax_blank.axis('off')
-                
                 for col_idx in range(3):
                     if col_idx >= len(plot_models): continue
                     self._plot_single_map(fig, gs, row_start, col_idx + 1, plot_models[col_idx], leadtime,
-                                          model_temporal_acc_maps, levels, cmap, lon_ticks, lat_ticks, 
-                                          chr(97 + col_idx))
+                                          model_temporal_acc_maps, levels, cmap, lon_ticks, lat_ticks, chr(97 + col_idx))
                     if col_idx == 0:
                          ax = fig.axes[-1]
                          ax.text(0.98, 0.96, f'L{leadtime}', transform=ax.transAxes, fontsize=18, fontweight='bold', va='top', ha='right')
-
                 for col_idx in range(4):
                     model_idx = col_idx + 3
                     if model_idx >= len(plot_models): continue
                     self._plot_single_map(fig, gs, row_start + 1, col_idx, plot_models[model_idx], leadtime,
-                                          model_temporal_acc_maps, levels, cmap, lon_ticks, lat_ticks, 
-                                          chr(97 + model_idx))
-            
+                                          model_temporal_acc_maps, levels, cmap, lon_ticks, lat_ticks, chr(97 + model_idx))
             cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.75])
             cbar = fig.colorbar(plt.cm.ScalarMappable(norm=mcolors.BoundaryNorm(levels, 256), cmap=cmap), 
                                 cax=cbar_ax, orientation='vertical', extend='both')
             cbar.set_label('Temporal ACC', fontsize=14, labelpad=10)
-            
             output_file = self.plot_dir / f"acc_spatial_maps_L0_L3_{self.var_type}.png"
             plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0.1)
             plt.close()
-            
         except Exception as e:
             logger.error(f"ACC空间分布图绘制失败: {e}")
 
     def _plot_single_map(self, fig, gs, row, col, model, leadtime, maps, levels, cmap, xticks, yticks, char_label):
+        # ... (保持不变)
         if leadtime not in maps[model]:
             ax = fig.add_subplot(gs[row, col]); ax.axis('off'); return
-            
         acc_ds = maps[model][leadtime]
         data = acc_ds['temporal_acc']
         display_name = model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')
-        
         ax = fig.add_subplot(gs[row, col], projection=ccrs.PlateCarree())
         ax.set_extent([70, 140, 15, 55], crs=ccrs.PlateCarree())
         ax.add_feature(cfeature.LAND, alpha=0.1); ax.add_feature(cfeature.OCEAN, alpha=0.1)
-        
         gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
         gl.top_labels = False; gl.right_labels = False
         gl.xlocator = FixedLocator(xticks); gl.ylocator = FixedLocator(yticks)
         gl.xformatter = LongitudeFormatter(number_format='.0f'); gl.yformatter = LatitudeFormatter(number_format='.0f')
-        
         im = ax.contourf(data.lon, data.lat, data, transform=ccrs.PlateCarree(), cmap=cmap, levels=levels, extend='both')
         self.add_china_map_details(ax, data, data.lon, data.lat, levels, cmap, draw_scs=True)
-        
         if 'significant' in acc_ds:
             sig_mask = acc_ds['significant'].values
             if np.any(sig_mask):
                 X, Y = np.meshgrid(data.lon, data.lat)
                 ax.scatter(X[sig_mask][::2], Y[sig_mask][::2], transform=ccrs.PlateCarree(), s=1, c='black', alpha=0.5, marker='.')
-        
         ax.text(0.02, 0.96, f"({char_label}) {display_name}", transform=ax.transAxes, fontsize=18, fontweight='bold', va='top')
 
     def plot_spatial_acc_heatmap_diverging_discrete(self, region_spatial_acc_data: Optional[Dict] = None):
-        """绘制离散型、对称分布（RdBu_r）的热图"""
+        # ... (保持不变)
         try:
             if region_spatial_acc_data is None or 'Global' not in region_spatial_acc_data: return
             global_data = region_spatial_acc_data['Global']
             plot_models = [m for m in MODELS if m in global_data and global_data[m]]
             if not plot_models: return
-
             months = np.arange(1, 13); leadtimes = np.arange(0, 6)
             model_matrices = {}; model_p_matrices = {}
-
             for model in plot_models:
                 acc_list = global_data[model]
                 combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
@@ -743,49 +690,41 @@ class SeasonalMonthlyPearsonAnalyzer:
                     model_p_matrices[model] = p_matrix
                 else:
                     model_p_matrices[model] = None
-
             n_bins = 20; levels = np.linspace(-1, 1, n_bins + 1)
             cmap = plt.get_cmap('RdBu_r', n_bins); norm = mcolors.BoundaryNorm(levels, ncolors=cmap.N, clip=True)
-
             fig, axes = plt.subplots(2, 4, figsize=(22, 10), sharex=False, sharey=False)
             axes[0, 0].axis('off')
             x_edges = np.arange(0.5, 13.5, 1); y_edges = np.arange(-0.5, 6.5, 1)
             X, Y = np.meshgrid(x_edges, y_edges)
             X_center, Y_center = np.meshgrid(months, leadtimes)
             mesh = None
-            
             for i, model in enumerate(plot_models):
                 row, col = (0, i + 1) if i < 3 else (1, i - 3)
                 ax = axes[row, col]
                 matrix = model_matrices[model]; p_matrix = model_p_matrices[model]
                 mesh = ax.pcolormesh(X, Y, matrix, cmap=cmap, norm=norm, edgecolor='face', linewidth=0.1, shading='flat')
-
                 if p_matrix is not None and np.isfinite(p_matrix).any():
                     sig_mask = (p_matrix < 0.05) & np.isfinite(matrix)
                     if np.any(sig_mask):
                         ax.scatter(X_center[sig_mask], Y_center[sig_mask], marker='.', s=18, color='black', alpha=0.8)
-
                 ax.set_title(f"({chr(97+i)}) {model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')}", fontsize=18, fontweight='bold', loc='left', pad=10)
                 ax.set_xticks(months); ax.set_yticks(leadtimes)
                 ax.set_xlabel('Month', fontsize=16); ax.set_ylabel('Lead Time', fontsize=16)
                 ax.tick_params(axis='both', which='major', labelsize=14)
                 ax.grid(False)
-
             plt.subplots_adjust(left=0.05, right=0.90, top=0.92, bottom=0.10, wspace=0.3, hspace=0.35)
             if mesh:
                 cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
                 cbar = fig.colorbar(mesh, cax=cbar_ax, orientation='vertical', ticks=levels)
                 cbar.set_label('Global Index ACC', fontsize=14, labelpad=15)
-                
             output_file = self.plot_dir / f"spatial_acc_heatmap_diverging_{self.var_type}.png"
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
             plt.close()
-
         except Exception as e:
             logger.error(f"离散型对称热图绘制失败: {e}")
 
     def save_temporal_acc_maps_to_nc(self, model_temporal_acc_maps: Dict[str, Dict[int, xr.Dataset]]):
-        """保存每个模式的 Temporal ACC 空间分布图 (leadtime, lat, lon) 到 NetCDF"""
+        # ... (保持不变)
         out_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/temporal_acc_maps/{self.var_type}")
         out_dir.mkdir(parents=True, exist_ok=True)
         for model, lt_to_map in model_temporal_acc_maps.items():
@@ -798,7 +737,7 @@ class SeasonalMonthlyPearsonAnalyzer:
                 logger.error(f"保存 Temporal ACC 空间分布失败 ({model}): {e}")
 
     def save_region_index_acc_to_nc(self, region_spatial_acc_data: Dict):
-        """将区域 Index ACC（Global + 9 区）保存为 NetCDF"""
+        # ... (保持不变，因为 dataset 结构已经包含 members 变量)
         if not region_spatial_acc_data: return
         for region_name, model_data in region_spatial_acc_data.items():
             for model, acc_list in model_data.items():
@@ -812,7 +751,7 @@ class SeasonalMonthlyPearsonAnalyzer:
                     logger.warning(f"保存区域 Index ACC 失败 ({region_name} {model}): {e}")
 
     def load_region_index_acc_from_nc(self, models: List[str]) -> Dict:
-        """从 NetCDF 加载区域 Index ACC"""
+        # ... (保持不变)
         region_spatial_acc_data = {r: {m: [] for m in models} for r in REGIONS.keys()}
         for region_name in REGIONS.keys():
             safe_region = region_name.replace(' ', '_')
@@ -830,7 +769,7 @@ class SeasonalMonthlyPearsonAnalyzer:
         return region_spatial_acc_data
 
     def save_spatial_acc_to_nc(self, model_spatial_acc_data: Dict[str, List[xr.Dataset]]):
-        """将空间ACC时间序列保存为NetCDF文件"""
+        # ... (保持不变)
         for model, acc_list in model_spatial_acc_data.items():
             if not acc_list: continue
             try:
@@ -845,11 +784,10 @@ class SeasonalMonthlyPearsonAnalyzer:
                 logger.error(f"空间ACC保存NetCDF失败 ({model}): {e}")
 
     def save_data_to_csv(self, results: Dict, save_dir: str = None):
-        """保存数据到CSV文件"""
         pass
 
     def plot_spatial_acc_leadtime_timeseries(self, region_spatial_acc_data: Optional[Dict] = None):
-        """绘制 Global 区域的 Index ACC 随 Leadtime 变化的折线图"""
+        """绘制 Global 区域的 Index ACC 随 Leadtime 变化的折线图 (增加 Spread)"""
         try:
             if region_spatial_acc_data is None or 'Global' not in region_spatial_acc_data: return
             global_data = region_spatial_acc_data['Global']
@@ -860,6 +798,31 @@ class SeasonalMonthlyPearsonAnalyzer:
             cmap = plt.get_cmap('tab10')
             all_leadtimes = set()
 
+            # --- 计算 Spread (所有模式所有成员) ---
+            spread_min = {}
+            spread_max = {}
+            
+            for model in plot_models:
+                acc_list = global_data[model]
+                combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
+                if 'regional_index_acc_members' in combined_ds:
+                    # (leadtime, number, month) -> mean over month -> (leadtime, number)
+                    da_mem = combined_ds['regional_index_acc_members'].mean(dim='month', skipna=True)
+                    for lt in da_mem.leadtime.values:
+                        vals = da_mem.sel(leadtime=lt).values.flatten()
+                        vals = vals[np.isfinite(vals)]
+                        if len(vals) > 0:
+                            lt_int = int(lt)
+                            spread_min.setdefault(lt_int, []).extend(vals)
+                            spread_max.setdefault(lt_int, []).extend(vals)
+            
+            sorted_lts = sorted(spread_min.keys())
+            if sorted_lts:
+                y_min = [np.min(spread_min[lt]) for lt in sorted_lts]
+                y_max = [np.max(spread_max[lt]) for lt in sorted_lts]
+                ax.fill_between(sorted_lts, y_min, y_max, color='gray', alpha=0.2, label='Multi-model Member Spread')
+
+            # --- 绘制 Ensemble Mean ---
             for i, model in enumerate(plot_models):
                 acc_list = global_data[model]
                 combined_ds = xr.concat(acc_list, dim='leadtime').sortby('leadtime')
@@ -879,9 +842,11 @@ class SeasonalMonthlyPearsonAnalyzer:
             plt.close()
         except Exception as e:
             logger.error(f"Global Index ACC 折线图绘制失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
     
     def plot_regional_index_acc_leadtime_timeseries(self, region_spatial_acc_data: Dict):
-        """绘制分区域的 Index ACC 随 Leadtime 变化的折线图"""
+        """绘制分区域的 Index ACC 随 Leadtime 变化的折线图 (增加 Spread)"""
         try:
             region_order = [
                 'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
@@ -909,6 +874,30 @@ class SeasonalMonthlyPearsonAnalyzer:
             for reg_name in regions:
                 ax = axes_dict[reg_name]
                 model_data = region_spatial_acc_data[reg_name]
+                
+                # --- 计算 Spread ---
+                spread_min = {}
+                spread_max = {}
+                for model in MODELS:
+                    if model not in model_data or not model_data[model]: continue
+                    combined_ds = xr.concat(model_data[model], dim='leadtime').sortby('leadtime')
+                    if 'regional_index_acc_members' in combined_ds:
+                        da_mem = combined_ds['regional_index_acc_members'].mean(dim='month', skipna=True)
+                        for lt in da_mem.leadtime.values:
+                            vals = da_mem.sel(leadtime=lt).values.flatten()
+                            vals = vals[np.isfinite(vals)]
+                            if len(vals) > 0:
+                                lt_int = int(lt)
+                                spread_min.setdefault(lt_int, []).extend(vals)
+                                spread_max.setdefault(lt_int, []).extend(vals)
+                
+                sorted_lts = sorted(spread_min.keys())
+                if sorted_lts:
+                    y_min = [np.min(spread_min[lt]) for lt in sorted_lts]
+                    y_max = [np.max(spread_max[lt]) for lt in sorted_lts]
+                    ax.fill_between(sorted_lts, y_min, y_max, color='gray', alpha=0.2, label='Multi-model Member Spread' if reg_name == regions[0] else "")
+
+                # --- 绘制 Mean ---
                 for mi, model in enumerate(MODELS):
                     if model not in model_data or not model_data[model]: continue
                     combined_ds = xr.concat(model_data[model], dim='leadtime').sortby('leadtime')
@@ -924,7 +913,10 @@ class SeasonalMonthlyPearsonAnalyzer:
             for ax in axes_dict.values(): ax.set_xticks(LEADTIMES)
             
             handles, labels = axes_dict[regions[0]].get_legend_handles_labels()
-            if handles: fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0), ncol=4, fontsize=16, frameon=False)
+            # 去重 legend
+            by_label = dict(zip(labels, handles))
+            if by_label: 
+                fig.legend(by_label.values(), by_label.keys(), loc='lower center', bbox_to_anchor=(0.5, 0), ncol=4, fontsize=16, frameon=False)
             
             plt.subplots_adjust(top=0.95, bottom=0.1, hspace=0.3, wspace=0.15)
             plt.savefig(self.plot_dir / f"regional_index_acc_leadtime_timeseries_{self.var_type}.png", dpi=300, bbox_inches='tight')
@@ -934,7 +926,7 @@ class SeasonalMonthlyPearsonAnalyzer:
             logger.error(f"分区域折线图绘制失败: {e}")
 
     def load_spatial_acc_from_nc(self, models: List[str]) -> Dict[str, List[xr.Dataset]]:
-        """从已保存的NetCDF文件加载空间ACC数据"""
+        # ... (保持不变)
         model_spatial_acc_data = {model: [] for model in models}
         for model in models:
             save_path = self.spatial_acc_dir / f"spatial_acc_timeseries_{model}_{self.var_type}.nc"
@@ -949,7 +941,7 @@ class SeasonalMonthlyPearsonAnalyzer:
         return model_spatial_acc_data
     
     def load_temporal_acc_maps_from_nc(self, models: List[str]) -> Dict[str, Dict[int, xr.Dataset]]:
-        """从已保存的NetCDF文件加载ACC空间分布数据"""
+        # ... (保持不变)
         model_temporal_acc_maps = {model: {} for model in models}
         out_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/temporal_acc_maps/{self.var_type}")
         for model in models:
@@ -1054,12 +1046,15 @@ def _compute_correlations_task(var_type: str, model: str, leadtime: int):
         acc_ts = None; acc_map = None; region_acc_dict = {}
         
         if obs_anom_field is not None and fcst_anom_field is not None:
+            # Global Mean ACC (Mean only)
             acc_ts = analyzer.calculate_temporal_acc_monthly_mean(obs_anom_field, fcst_anom_field)
             if acc_ts is not None: acc_ts = acc_ts.expand_dims(leadtime=[leadtime])
             
+            # Spatial Map (Mean only)
             acc_map = analyzer.calculate_temporal_acc_map(obs_anom_field, fcst_anom_field)
             if acc_map is not None: acc_map = acc_map.expand_dims(leadtime=[leadtime])
             
+            # Regional Index ACC (Mean + Members)
             for reg_name, reg_bounds in REGIONS.items():
                 reg_acc_ds = analyzer.calculate_regional_index_acc(obs_anom_field, fcst_anom_field, reg_bounds)
                 if reg_acc_ds is not None:
