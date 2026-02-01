@@ -185,7 +185,6 @@ class SeasonalMonthlyPearsonAnalyzer:
             
             # 模式的气候态
             # 如果 fcst_data 有 'number' 维度，groupby('time.month').mean('time') 会对每个 member 计算气候态
-            # 或者，我们可以使用 ensemble mean 的气候态？
             # 这里的做法是：每个 member 减去该 member 自己的气候态 (或者 ensemble mean 的气候态)。
             # 通常 ACC 计算中，每个 member 减去其自身的气候态是比较标准的做法。
             fcst_clim = fcst_data.groupby('time.month').mean('time')

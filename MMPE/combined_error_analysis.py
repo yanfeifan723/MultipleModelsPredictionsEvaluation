@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多模式误差分析计算模块 (RMSE, MAE, Bias) (Fixed V3 - Robust Calculation)
+多模式误差分析计算模块 (RMSE, MAE, Bias) (Fixed V4 - Robust Plotting)
 修改说明：
 1. 增加 Ensemble Member 维度的误差计算 (RMSE, MAE, Bias)。
 2. 绘图时增加所有模式所有成员的 Spread 阴影。
-3. 保存时包含 member 变量。
+3. 显式设置 zorder 确保折线绘制在阴影之上。
+4. 保存时包含 member 变量。
 """
 
 import sys
@@ -96,7 +97,6 @@ class MultiModelErrorAnalyzer:
         """仅对温度进行单位换算 (K -> C)"""
         if self.var_type == 'temp':
             # 如果均值 > 200，认为是Kelvin，转换为Celsius
-            # 注意：如果是 Ensemble 数据，使用 mean() 需要谨慎，但判断单位通常只需大致范围
             if ds.mean(skipna=True) > 200:
                 ds = ds - 273.15
         return ds
@@ -106,10 +106,7 @@ class MultiModelErrorAnalyzer:
         使用 regionmask 应用海陆掩模 (保留陆地，去除海洋)
         """
         try:
-            # 如果 ds 有 number 维度，regionmask.mask(ds) 可能需要处理
-            # 通常 mask 是基于 lat/lon 的，可以广播
             if 'number' in ds.dims:
-                # 使用一个 slice 来生成 mask
                 sample = ds.isel(number=0, drop=True) if ds.sizes['number'] > 0 else ds
                 land_mask = regionmask.defined_regions.natural_earth_v5_0_0.land_110.mask(sample)
             else:
@@ -164,9 +161,8 @@ class MultiModelErrorAnalyzer:
             return None, None
 
     def calculate_pointwise_metrics(self, obs: xr.DataArray, fcst: xr.DataArray) -> xr.Dataset:
-        """计算逐格点指标 (Time Mean)。仅用于绘图，使用 Ensemble Mean。"""
+        """计算逐格点指标 (Time Mean)。使用 Ensemble Mean。"""
         try:
-            # 使用 Ensemble Mean 进行空间分布绘图
             if 'number' in fcst.dims:
                 fcst_input = fcst.mean(dim='number')
             else:
@@ -242,7 +238,7 @@ class MultiModelErrorAnalyzer:
 
             # 5. 保存结果
             ds = xr.Dataset({
-                # Ensemble Mean Metrics (Compatible with existing plots)
+                # Ensemble Mean Metrics
                 'rmse_ts': np.sqrt(mse_ts_mean),
                 'mae_ts': mae_ts_mean,
                 'bias_ts': bias_ts_mean,
@@ -250,7 +246,7 @@ class MultiModelErrorAnalyzer:
                 'mae_monthly': mae_monthly_mean,
                 'bias_monthly': bias_monthly_mean,
                 
-                # Member Metrics (New)
+                # Member Metrics
                 'rmse_ts_members': np.sqrt(mse_ts_members),
                 'mae_ts_members': mae_ts_members,
                 'bias_ts_members': bias_ts_members,
@@ -267,7 +263,7 @@ class MultiModelErrorAnalyzer:
             return None
 
     def save_spatial_maps(self, model_metric_maps: Dict, models: List[str], leadtimes: List[int]):
-        # ... (保持不变)
+        """保存空间图数据"""
         for model in models:
             for lt in leadtimes:
                 if model not in model_metric_maps or lt not in model_metric_maps[model]:
@@ -279,7 +275,7 @@ class MultiModelErrorAnalyzer:
                     logger.warning(f"保存空间图失败 {fpath}: {e}")
 
     def load_spatial_maps(self, models: List[str], leadtimes: List[int]) -> Dict:
-        # ... (保持不变)
+        """从磁盘加载空间图数据"""
         out = {m: {} for m in models}
         for model in models:
             for lt in leadtimes:
@@ -291,7 +287,7 @@ class MultiModelErrorAnalyzer:
         return out
 
     def save_region_metrics(self, region_metric_data: Dict, models: List[str]):
-        # ... (保持不变，Dataset结构已更新)
+        """保存区域指标数据"""
         for r_name in REGIONS:
             if r_name not in region_metric_data: continue
             for model in models:
@@ -305,7 +301,7 @@ class MultiModelErrorAnalyzer:
                     logger.warning(f"保存区域指标失败 {r_name} {model}: {e}")
 
     def load_region_metrics(self, models: List[str]) -> Dict:
-        # ... (保持不变)
+        """从磁盘加载区域指标数据"""
         out = {r: {m: [] for m in models} for r in REGIONS}
         for r_name in REGIONS:
             for model in models:
@@ -319,7 +315,7 @@ class MultiModelErrorAnalyzer:
         return out
 
     def get_plotting_params(self, metric: str):
-        # ... (保持不变)
+        """获取绘图参数"""
         n_bins = 20
         if metric in ['rmse', 'mae']:
             if self.var_type == 'temp':
@@ -344,12 +340,13 @@ class MultiModelErrorAnalyzer:
         return cmap, levels, norm, extend
 
     def add_china_map_details(self, ax, data, lon, lat, levels, cmap, norm, extend):
-        # ... (保持不变)
+        """添加中国地图细节"""
         bou_paths = [
             Path("/sas12t1/ffyan/boundaries/中国_省1.shp"),
             Path("/sas12t1/ffyan/boundaries/中国_省2.shp")
         ]
         hyd_path = self.boundaries_dir / "河流.shp"
+        
         if hyd_path.exists():
             try:
                 reader = shpreader.Reader(str(hyd_path))
@@ -358,7 +355,9 @@ class MultiModelErrorAnalyzer:
             except: pass
         else:
             ax.add_feature(cfeature.RIVERS, edgecolor='blue', linewidth=0.6, alpha=0.6)
+            
         ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+        
         loaded = False
         for p in bou_paths:
             if p.exists():
@@ -370,6 +369,7 @@ class MultiModelErrorAnalyzer:
                 except: pass
         if not loaded:
             ax.add_feature(cfeature.BORDERS, linewidth=1.0)
+            
         try:
             sub_ax = ax.inset_axes([0.7548, 0, 0.33, 0.35], projection=ccrs.PlateCarree())
             sub_ax.patch.set_facecolor('white')
@@ -390,19 +390,24 @@ class MultiModelErrorAnalyzer:
             logger.warning(f"南海子图绘制失败: {e}")
 
     def plot_metric_spatial_maps(self, model_metric_maps: Dict, metric_key: str, title_metric: str):
-        # ... (保持不变)
+        """绘制空间分布图"""
         try:
             plot_models = list(model_metric_maps.keys())
             leadtimes = [0, 3]
+            
             cmap, levels, norm, extend = self.get_plotting_params(metric_key)
+            
             fig = plt.figure(figsize=(20, 12))
             gs = GridSpec(4, 4, figure=fig, hspace=0.25, wspace=0.15,
                          left=0.05, right=0.92, top=0.94, bottom=0.06)
+            
             lon_ticks = np.arange(75, 141, 15)
             lat_ticks = np.arange(20, 56, 10)
+
             for lt_idx, leadtime in enumerate(leadtimes):
                 row_start = lt_idx * 2
                 ax_blank = fig.add_subplot(gs[row_start, 0]); ax_blank.axis('off')
+                
                 for col_idx in range(3):
                     if col_idx >= len(plot_models): break
                     self._plot_single_map(fig, gs, row_start, col_idx + 1, plot_models[col_idx], 
@@ -418,34 +423,43 @@ class MultiModelErrorAnalyzer:
                     self._plot_single_map(fig, gs, row_start + 1, col_idx, plot_models[model_idx], 
                                         leadtime, model_metric_maps, metric_key, cmap, levels, norm, extend,
                                         lon_ticks, lat_ticks, chr(97 + model_idx))
+
             cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.75])
             cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cbar_ax, 
                                ticks=levels[::2], extend=extend)
             cbar.set_label(f'{title_metric} ({self.unit_label})', fontsize=18)
+            
             output_file = self.plot_dir / f"{metric_key}_spatial_maps_L0_L3_{self.var_type}.png"
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
             plt.close()
             logger.info(f"{title_metric} 空间图已保存: {output_file}")
+            
         except Exception as e:
             logger.error(f"绘图失败: {e}")
 
     def _plot_single_map(self, fig, gs, row, col, model, leadtime, maps, metric, cmap, levels, norm, extend, xticks, yticks, label_char):
-        # ... (保持不变)
         if leadtime not in maps[model]:
             ax = fig.add_subplot(gs[row, col]); ax.axis('off'); return
+
         ds = maps[model][leadtime]
         if metric not in ds: return
         data = ds[metric]
+
         ax = fig.add_subplot(gs[row, col], projection=ccrs.PlateCarree())
         ax.set_extent([70, 140, 15, 55], crs=ccrs.PlateCarree())
         ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+        
         gl = ax.gridlines(draw_labels=True, linewidth=0.5, linestyle='--')
         gl.top_labels = False; gl.right_labels = False
         gl.xlocator = FixedLocator(xticks); gl.ylocator = FixedLocator(yticks)
-        gl.xformatter = LongitudeFormatter(number_format='.0f'); gl.yformatter = LatitudeFormatter(number_format='.0f')
+        gl.xformatter = LongitudeFormatter(number_format='.0f')
+        gl.yformatter = LatitudeFormatter(number_format='.0f')
+        
         im = ax.contourf(data.lon, data.lat, data, transform=ccrs.PlateCarree(),
                         cmap=cmap, levels=levels, norm=norm, extend=extend)
+        
         self.add_china_map_details(ax, data, data.lon, data.lat, levels, cmap, norm, extend)
+        
         display_name = model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')
         ax.text(0.02, 0.96, f"({label_char}) {display_name}", transform=ax.transAxes,
                fontsize=18, fontweight='bold', va='top')
@@ -457,6 +471,7 @@ class MultiModelErrorAnalyzer:
         """
         try:
             for leadtime in LEADTIMES:
+                
                 if is_global:
                     regions = ['Global']
                     fig = plt.figure(figsize=(10, 6))
@@ -471,6 +486,7 @@ class MultiModelErrorAnalyzer:
                     ]
                     regions = [r for r in region_order if r in region_metric_data]
                     if not regions: continue
+                    
                     fig = plt.figure(figsize=(18, 15))
                     axes = {}
                     subplot_map = {
@@ -493,13 +509,12 @@ class MultiModelErrorAnalyzer:
                     ax = axes[reg]
                     models_data = region_metric_data[reg]
                     
-                    # --- 计算 Spread (所有模式所有成员) ---
+                    # --- 1. 绘制 Spread (阴影) ---
+                    # zorder=1 确保在底层
                     spread_min = {}
                     spread_max = {}
-                    months_range = range(1, 13)
                     
                     for model, ds_list in models_data.items():
-                         # 找到对应 leadtime 的 dataset
                         ds_lt = None
                         for ds in ds_list:
                             if 'leadtime' in ds and int(ds.leadtime) == leadtime:
@@ -509,7 +524,6 @@ class MultiModelErrorAnalyzer:
                         
                         var_name_mem = f"{metric}_monthly_members"
                         if var_name_mem in ds_lt:
-                             # (number, month)
                             da_mem = ds_lt[var_name_mem]
                             if 'month' not in da_mem.coords: continue
                             
@@ -525,9 +539,12 @@ class MultiModelErrorAnalyzer:
                     if sorted_months:
                          y_min = [np.min(spread_min[m]) for m in sorted_months]
                          y_max = [np.max(spread_max[m]) for m in sorted_months]
-                         ax.fill_between(sorted_months, y_min, y_max, color='gray', alpha=0.2, label='Multi-model Member Spread' if (is_global or reg == regions[0]) else "")
+                         ax.fill_between(sorted_months, y_min, y_max, 
+                                         color='gray', alpha=0.2, zorder=1, 
+                                         label='Multi-model Member Spread' if (is_global or reg == regions[0]) else "")
 
-                    # --- 绘制 Mean Lines ---
+                    # --- 2. 绘制 Mean Lines (折线) ---
+                    # zorder=10 确保在顶层
                     for i, (model, ds_list) in enumerate(models_data.items()):
                         ds_lt = None
                         for ds in ds_list:
@@ -538,20 +555,27 @@ class MultiModelErrorAnalyzer:
                         
                         var_name = f"{metric}_monthly"
                         if var_name not in ds_lt: continue
+                        
                         da = ds_lt[var_name]
                         if 'month' in da.coords:
                              x_vals = da.month.values
-                             y_vals = da.values
+                             y_vals = da.values.flatten() # 强制扁平化
                         elif da.size == 12:
                              x_vals = np.arange(1, 13)
                              y_vals = da.values.flatten()
                         else: continue
                             
                         if len(x_vals) != len(y_vals): continue
-                        all_vals_for_ylim.extend(y_vals[np.isfinite(y_vals)])
+                        
+                        # 过滤 NaN 仅用于 ylim 计算，绘图时保留 NaN 以显示断点
+                        valid_y = y_vals[np.isfinite(y_vals)]
+                        if len(valid_y) > 0:
+                            all_vals_for_ylim.extend(valid_y)
                         
                         label = model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC') if (is_global or reg == regions[0]) else ""
-                        ax.plot(x_vals, y_vals, marker='o', markersize=4, label=label, color=cmap(i % 10))
+                        
+                        ax.plot(x_vals, y_vals, marker='o', markersize=4, 
+                                label=label, color=cmap(i % 10), zorder=10)
                     
                     if not is_global: 
                         ax.set_title(f"{reg}", fontweight='bold')

@@ -103,7 +103,7 @@ class RegionalHeatMapPlotter:
                             if int(lt) in ds.leadtime.values:
                                 ds_lt = ds.sel(leadtime=int(lt))
                                 
-                                # --- Monthly ACC (Read standard variable) ---
+                                # --- Monthly ACC (Read standard variable which is Ens Mean) ---
                                 if 'regional_index_acc' in ds_lt:
                                     da_acc = ds_lt['regional_index_acc']
                                     da_p = ds_lt.get('p_value')
