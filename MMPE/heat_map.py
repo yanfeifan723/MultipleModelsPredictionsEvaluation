@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多区域四重指标(Bias, MAE, RMSE, ACC)组合热图绘制模块 (Fixed V8)
+多区域三重指标(Bias, RMSE, ACC)组合热图绘制模块 (Fixed V9)
 修复与优化：
-1. 修复 Bias/ACC 在 extend='both' 时的 n_colors 计算错误。
-2. 优化 Bias 刻度：使用 MaxNLocator 生成以0为中心的整齐对称刻度。
-3. 统一 MAE 和 RMSE 的 Colorbar 分段（Levels）和颜色映射（Colormap）。
-4. 增大所有刻度字体 (Heatmap axes & Colorbar ticks)。
-5. 减小 Regions Colorbar 宽度 (变细)。
+1. 移除 MAE 指标绘制。
+2. 支持读取并绘制带显著性检验的季节性 ACC (Seasonal ACC & P-value)。
+3. 修复 Bias/ACC 在 extend='both' 时的 n_colors 计算错误。
+4. 优化 Bias 刻度：使用 MaxNLocator 生成以0为中心的整齐对称刻度。
+5. 增大所有刻度字体 (Heatmap axes & Colorbar ticks)。
+6. 减小 Regions Colorbar 宽度 (变细)。
 """
 
 import sys
@@ -61,12 +62,13 @@ class RegionalHeatMapPlotter:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def load_regional_data(self, region: str) -> Dict:
-        """加载数据 (Bias, MAE, RMSE, ACC)"""
+        """加载数据 (Bias, RMSE, ACC)"""
         data = {}
         safe_region = region.replace(' ', '_')
 
         for lt in LEADTIMES:
-            data[lt] = {'bias': {}, 'mae': {}, 'rmse': {}, 'acc': {}}
+            # 移除 'mae'
+            data[lt] = {'bias': {}, 'rmse': {}, 'acc': {}}
 
             for model in MODEL_LIST:
                 # 1. ACC
@@ -78,6 +80,8 @@ class RegionalHeatMapPlotter:
                         with xr.open_dataset(acc_file) as ds:
                             if int(lt) in ds.leadtime.values:
                                 ds_lt = ds.sel(leadtime=int(lt))
+                                
+                                # --- Monthly ACC ---
                                 for m in range(1, 13):
                                     m_name = MONTHS[m-1]
                                     if m in ds_lt.month.values:
@@ -91,19 +95,35 @@ class RegionalHeatMapPlotter:
                                         acc_entry['monthly'][m_name] = np.nan
                                         acc_entry['monthly_p'][m_name] = np.nan
                                 
-                                for seas, m_idxs in SEASONS.items():
-                                    vals = [acc_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
-                                    acc_entry['seasonal'][seas] = float(np.nanmean(vals))
-                                    acc_entry['seasonal_p'][seas] = np.nan 
+                                # --- Seasonal ACC (尝试读取预计算的季节性 ACC) ---
+                                if 'regional_index_acc_seasonal' in ds_lt and 'season' in ds_lt.coords:
+                                    # 读取科学计算的季节 ACC 和 P 值
+                                    for seas in SEASONS.keys():
+                                        if seas in ds_lt.season.values:
+                                            val = float(ds_lt.regional_index_acc_seasonal.sel(season=seas).values)
+                                            p_val = np.nan
+                                            if 'p_value_seasonal' in ds_lt:
+                                                p_val = float(ds_lt.p_value_seasonal.sel(season=seas).values)
+                                            acc_entry['seasonal'][seas] = val
+                                            acc_entry['seasonal_p'][seas] = p_val
+                                        else:
+                                            acc_entry['seasonal'][seas] = np.nan
+                                            acc_entry['seasonal_p'][seas] = np.nan
+                                else:
+                                    # 回退逻辑：如果没有季节性变量，则使用月平均（无 p-value）
+                                    for seas, m_idxs in SEASONS.items():
+                                        vals = [acc_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
+                                        acc_entry['seasonal'][seas] = float(np.nanmean(vals))
+                                        acc_entry['seasonal_p'][seas] = np.nan 
                                 
                                 data[lt]['acc'][model] = acc_entry
                     except Exception as e:
+                        # logger.warning(f"Failed loading ACC for {model} {lt}: {e}")
                         pass
 
-                # 2. Error Metrics
+                # 2. Error Metrics (Bias, RMSE) - 移除 MAE
                 err_file = self.error_base_dir / f"{region}_{model}.nc"
                 bias_entry = {'monthly': {}, 'seasonal': {}}
-                mae_entry = {'monthly': {}, 'seasonal': {}}
                 rmse_entry = {'monthly': {}, 'seasonal': {}}
                 
                 if err_file.exists():
@@ -140,11 +160,10 @@ class RegionalHeatMapPlotter:
                                             target_entry['seasonal'][seas] = float(np.nanmean(vals))
 
                                 extract_metric(ds_lt, 'bias', bias_entry)
-                                extract_metric(ds_lt, 'mae', mae_entry)
+                                # extract_metric(ds_lt, 'mae', mae_entry) # 移除 MAE
                                 extract_metric(ds_lt, 'rmse', rmse_entry)
                                 
                                 data[lt]['bias'][model] = bias_entry
-                                data[lt]['mae'][model] = mae_entry
                                 data[lt]['rmse'][model] = rmse_entry
                     except Exception as e:
                         pass
@@ -179,8 +198,8 @@ class RegionalHeatMapPlotter:
             norm = BoundaryNorm(levels, n_colors, extend='both')
             return norm, cmap, levels
 
-        # --- 2. RMSE & MAE (Sequential) ---
-        elif metric in ['rmse', 'mae']:
+        # --- 2. RMSE (Sequential) ---
+        elif metric == 'rmse':
             valid_pos = [x for x in valid if x >= 0]
             vmin = 0
             vmax_raw = np.nanmax(valid_pos) if valid_pos else 1.0
@@ -254,13 +273,14 @@ class RegionalHeatMapPlotter:
                     rect = patches.Rectangle((j, i), 1, 1, facecolor=color, edgecolor='none')
                     ax.add_patch(rect)
                     
+                    # 显著性打点 (p < 0.05)
                     if metric == 'acc' and np.isfinite(p_val) and p_val < 0.05:
                         ax.scatter(j + 0.5, i + 0.5, s=25, c='black', marker='o', linewidths=0)
 
         # 轴标签处理 (增大字体)
         ax.set_xticks(np.arange(cols) + 0.5)
         if show_xticklabels:
-            ax.set_xticklabels([m.replace('-mon', '').replace('Meteo-France', 'MF') for m in models], 
+            ax.set_xticklabels([m.replace('-mon', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC') for m in models], 
                                rotation=45, ha='right', fontsize=14)
         else:
             ax.set_xticklabels([])
@@ -277,27 +297,27 @@ class RegionalHeatMapPlotter:
         models = [m for m in MODEL_LIST if m in global_data['rmse']]
         if not models: return
 
-        fig = plt.figure(figsize=(22, 12))
-        gs = gridspec.GridSpec(2, 4, figure=fig, hspace=0.05, wspace=0.05)
+        # 调整布局：2行 x 3列 (Bias, RMSE, ACC)
+        fig = plt.figure(figsize=(18, 12)) # 稍微调窄一点因为少了一列
+        gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.05, wspace=0.05)
         
-        vals = {m: [] for m in ['bias', 'mae', 'rmse', 'acc']}
-        for met in ['bias', 'mae', 'rmse', 'acc']:
+        # 移除 'mae'
+        vals = {m: [] for m in ['bias', 'rmse', 'acc']}
+        for met in ['bias', 'rmse', 'acc']:
             for m in models:
                 vals[met].extend(global_data[met][m].get('monthly', {}).values())
                 vals[met].extend(global_data[met][m].get('seasonal', {}).values())
         
-        # 统一 MAE/RMSE
-        combined_err = vals['rmse'] + vals['mae']
-        norm_err, cmap_err, levels_err = self._get_levels_and_cmap(combined_err, 'rmse')
+        # 仅使用 RMSE 数据
+        norm_rmse, cmap_rmse, levels_rmse = self._get_levels_and_cmap(vals['rmse'], 'rmse')
 
         configs = {}
         configs['bias'] = self._get_levels_and_cmap(vals['bias'], 'bias')
         configs['acc'] = self._get_levels_and_cmap(vals['acc'], 'acc')
-        configs['rmse'] = (norm_err, cmap_err, levels_err)
-        configs['mae'] = (norm_err, cmap_err, levels_err)
+        configs['rmse'] = (norm_rmse, cmap_rmse, levels_rmse)
 
-        metrics_order = ['bias', 'mae', 'rmse', 'acc']
-        titles = {'bias': 'Bias', 'mae': 'MAE', 'rmse': 'RMSE', 'acc': 'ACC'}
+        metrics_order = ['bias', 'rmse', 'acc']
+        titles = {'bias': 'Bias', 'rmse': 'RMSE', 'acc': 'ACC'}
         
         for col, metric in enumerate(metrics_order):
             norm, cmap, levels = configs[metric]
@@ -317,8 +337,9 @@ class RegionalHeatMapPlotter:
         unit = '°C' if self.var_type == 'temp' else 'mm/day'
         for col, metric in enumerate(metrics_order):
             norm, cmap, levels = configs[metric]
-            left = 0.13 + col * 0.205
-            cax = fig.add_axes([left, 0.02, 0.18, 0.012])
+            # 重新计算 colorbar 位置 (3列)
+            left = 0.13 + col * 0.27
+            cax = fig.add_axes([left, 0.02, 0.22, 0.012])
             
             extend = 'both' if metric in ['bias', 'acc'] else 'max'
             cb = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation='horizontal', extend=extend)
@@ -345,29 +366,28 @@ class RegionalHeatMapPlotter:
     def plot_regions_figure(self, leadtime: int, regions_data: Dict[str, Dict]):
         models = MODEL_LIST
         
-        vals = {m: [] for m in ['bias', 'mae', 'rmse', 'acc']}
+        vals = {m: [] for m in ['bias', 'rmse', 'acc']}
         for reg_d in regions_data.values():
-            for met in ['bias', 'mae', 'rmse', 'acc']:
+            for met in ['bias', 'rmse', 'acc']:
                 for m in models:
                     if m in reg_d[met]:
                         vals[met].extend(reg_d[met][m].get('monthly', {}).values())
                         vals[met].extend(reg_d[met][m].get('seasonal', {}).values())
 
-        # 统一 MAE/RMSE
-        combined_err = vals['rmse'] + vals['mae']
-        norm_err, cmap_err, levels_err = self._get_levels_and_cmap(combined_err, 'rmse')
+        # 仅使用 RMSE 数据
+        norm_rmse, cmap_rmse, levels_rmse = self._get_levels_and_cmap(vals['rmse'], 'rmse')
 
         configs = {}
         configs['bias'] = self._get_levels_and_cmap(vals['bias'], 'bias')
         configs['acc'] = self._get_levels_and_cmap(vals['acc'], 'acc')
-        configs['rmse'] = (norm_err, cmap_err, levels_err)
-        configs['mae'] = (norm_err, cmap_err, levels_err)
+        configs['rmse'] = (norm_rmse, cmap_rmse, levels_rmse)
 
-        fig = plt.figure(figsize=(40, 22)) 
-        outer_gs = gridspec.GridSpec(2, 4, figure=fig, hspace=0.05, wspace=0.05, height_ratios=[1, 0.45]) 
+        fig = plt.figure(figsize=(30, 22)) 
+        # 调整为 2行 x 3列
+        outer_gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.05, wspace=0.05, height_ratios=[1, 0.45]) 
         
-        metrics_order = ['bias', 'mae', 'rmse', 'acc']
-        titles = {'bias': 'Bias', 'mae': 'MAE', 'rmse': 'RMSE', 'acc': 'ACC'}
+        metrics_order = ['bias', 'rmse', 'acc']
+        titles = {'bias': 'Bias', 'rmse': 'RMSE', 'acc': 'ACC'}
         
         region_grid = [
             ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast'],
@@ -408,9 +428,9 @@ class RegionalHeatMapPlotter:
         for col, metric in enumerate(metrics_order):
             norm, cmap, levels = configs[metric]
             
-            # 减小宽度（height从0.015->0.010, width从0.18->0.16）
-            left = 0.125 + col * 0.202
-            cax = fig.add_axes([left + 0.01, 0.04, 0.16, 0.010])
+            # 重新计算 colorbar 位置 (3列)
+            left = 0.125 + col * 0.27
+            cax = fig.add_axes([left + 0.01, 0.04, 0.22, 0.010])
             
             extend = 'both' if metric in ['bias', 'acc'] else 'max'
             cb = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation='horizontal', extend=extend)
