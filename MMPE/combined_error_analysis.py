@@ -67,8 +67,8 @@ def generate_regions():
         'Z3-Northeast':     {'lat': (40, 54), 'lon': (119, 135)},
         'Z4-Tibetan':       {'lat': (27, 39), 'lon': (73, 95)},
         'Z5-NorthChina':    {'lat': (34, 39), 'lon': (106, 122)},
-        'Z7-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},
-        'Z6-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},
+        'Z6-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},
+        'Z7-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},
         'Z8-SouthChina':    {'lat': (21, 25), 'lon': (106, 120)},
         'Z9-SouthSea':      {'lat': (18, 21), 'lon': (105, 125)}
     })
@@ -495,8 +495,8 @@ class MultiModelErrorAnalyzer:
             else:
                 region_order = [
                     'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
-                    'Z4-Tibetan',   'Z5-NorthChina',    'Z7-Yangtze',
-                    'Z6-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+                    'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
+                    'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
                 ]
                 regions = [r for r in region_order if r in region_metric_data]
                 if not regions: return
@@ -504,8 +504,8 @@ class MultiModelErrorAnalyzer:
                 axes = {}
                 subplot_map = {
                     'Z1-Northwest': (0,0), 'Z2-InnerMongolia': (0,1), 'Z3-Northeast': (0,2),
-                    'Z4-Tibetan': (1,0), 'Z5-NorthChina': (1,1), 'Z7-Yangtze': (1,2),
-                    'Z6-Southwest': (2,0), 'Z8-SouthChina': (2,1), 'Z9-SouthSea': (2,2)
+                    'Z4-Tibetan': (1,0), 'Z5-NorthChina': (1,1), 'Z6-Yangtze': (1,2),
+                    'Z7-Southwest': (2,0), 'Z8-SouthChina': (2,1), 'Z9-SouthSea': (2,2)
                 }
                 for r in regions:
                     row, col = subplot_map[r]

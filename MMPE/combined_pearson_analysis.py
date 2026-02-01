@@ -160,9 +160,9 @@ def generate_regions():
         # --- 中部行 ---
         'Z4-Tibetan':       {'lat': (27, 39), 'lon': (73, 95)},    # 青藏高寒区
         'Z5-NorthChina':    {'lat': (34, 39), 'lon': (106, 122)},  # 黄土-华北区
-        'Z7-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},  # 长江中下游区
+        'Z6-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},  # 长江中下游区
         # --- 南部行 ---
-        'Z6-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},   # 四川-西南区
+        'Z7-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},   # 四川-西南区
         'Z8-SouthChina':    {'lat': (21, 25), 'lon': (106, 120)},  # 华南湿润区
         'Z9-SouthSea':      {'lat': (18, 21), 'lon': (105, 125)}   # 南海热带区
     })
@@ -1451,8 +1451,8 @@ class SeasonalMonthlyPearsonAnalyzer:
             # 第三行：西南(Z6) - 华南(Z8) - 南海(Z9)
             subplot_positions = {
                 'Z1-Northwest':     (0, 0), 'Z2-InnerMongolia': (0, 1), 'Z3-Northeast': (0, 2),
-                'Z4-Tibetan':       (1, 0), 'Z5-NorthChina':    (1, 1), 'Z7-Yangtze':   (1, 2),
-                'Z6-Southwest':     (2, 0), 'Z8-SouthChina':    (2, 1), 'Z9-SouthSea':  (2, 2)
+                'Z4-Tibetan':       (1, 0), 'Z5-NorthChina':    (1, 1), 'Z6-Yangtze':   (1, 2),
+                'Z7-Southwest':     (2, 0), 'Z8-SouthChina':    (2, 1), 'Z9-SouthSea':  (2, 2)
             }
             
             cmap = plt.get_cmap('tab10')
