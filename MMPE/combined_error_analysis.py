@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多模式误差分析计算模块 (RMSE, MAE, Bias)
-绘制三种指标的空间分布图与折线图，包含海陆掩模处理与特定配色方案。
-
-功能特性:
-1. 计算并绘制三种指标:
-   - RMSE (均方根误差): 反映总误差幅度
-   - MAE (平均绝对误差): 反映平均误差大小
-   - Bias (偏差): 反映系统性冷暖/干湿倾向
-2. 空间分布图配色:
-   - RMSE/MAE (Temp): 白->红 (MPL_Reds)
-   - RMSE/MAE (Prec): 白->蓝 (MPL_Blues)
-   - Bias (Temp): 蓝(冷)->白->红(暖) (RdBu_r)
-   - Bias (Prec): 红(干)->白->蓝(湿) (RdBu)
-3. 强制应用海陆掩模 (Land-Sea Mask)，仅保留陆地数据
-4. 折线图: 包含轴标签和单位
-
-运行环境要求:
-- 需要安装 regionmask: pip install regionmask
+多模式误差分析计算模块 (RMSE, MAE, Bias) (Fixed V3 - Robust Calculation)
+修改说明：
+1. 修正计算方式：先计算全时间序列的空间平均，再聚合月度气候态。
+2. 确保维度正确：使用 reindex 强制对齐 1-12 月，解决绘图时的维度不匹配问题。
+3. 保留更多信息：同时保存逐月时间序列 (Time Series) 和月度气候态 (Climatology)。
+4. 增强绘图鲁棒性：增加对数据形状的显式检查和处理。
 """
 
 import sys
@@ -57,6 +45,7 @@ from common_config import (
 
 # 配置参数
 MODELS = MODEL_LIST
+MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 # === 定义区域 ===
 def generate_regions():
@@ -118,26 +107,22 @@ class MultiModelErrorAnalyzer:
         """
         try:
             # 使用 Natural Earth 的陆地掩模 (land_110)
-            # mask返回: 0=陆地, NaN=海洋 (取决于版本)
             land_mask = regionmask.defined_regions.natural_earth_v5_0_0.land_110.mask(ds)
             # 保留 mask == 0 的部分 (陆地)
             ds_masked = ds.where(land_mask == 0)
             return ds_masked
         except Exception as e:
-            logger.warning(f"海陆掩模应用失败 (请确保安装 regionmask): {e}")
             return ds
 
     def load_and_preprocess_data(self, model: str, leadtime: int) -> Tuple[xr.DataArray, xr.DataArray]:
         """加载数据、处理单位、应用掩模"""
         try:
             # 1. 加载观测
-            # DataLoader 会自动处理降水单位 (mm/day)
             obs_data = self.data_loader.load_obs_data(self.var_type)
             obs_data = obs_data.resample(time='1MS').mean()
             obs_data = obs_data.sel(time=slice('1993', '2020'))
             
             # 2. 加载模式
-            # DataLoader 会自动处理降水单位 (mm/day)
             fcst_data = self.data_loader.load_forecast_data(model, self.var_type, leadtime)
             if fcst_data is None:
                 return None, None
@@ -153,7 +138,6 @@ class MultiModelErrorAnalyzer:
             fcst_aligned = fcst_data.sel(time=common_times)
             
             # 4. 温度单位转换 (K -> C)
-            # 注意：降水不需要在这里转换，因为 DataLoader 已经转了
             obs_conv = self.convert_temp_units(obs_aligned)
             fcst_conv = self.convert_temp_units(fcst_aligned)
             
@@ -163,7 +147,6 @@ class MultiModelErrorAnalyzer:
             )
             
             # 6. === 应用海陆掩模 ===
-            # 计算前剔除海洋
             obs_masked = self.apply_land_mask(obs_conv)
             fcst_masked = self.apply_land_mask(fcst_interpolated)
 
@@ -174,17 +157,12 @@ class MultiModelErrorAnalyzer:
             return None, None
 
     def calculate_pointwise_metrics(self, obs: xr.DataArray, fcst: xr.DataArray) -> xr.Dataset:
-        """计算逐格点指标"""
+        """计算逐格点指标 (Time Mean)"""
         try:
             diff = fcst - obs
-            
-            # RMSE
             rmse_map = np.sqrt((diff ** 2).mean(dim='time', skipna=True))
-            # Bias (偏差)
             bias_map = diff.mean(dim='time', skipna=True)
-            # MAE (平均绝对误差)
             mae_map = np.abs(diff).mean(dim='time', skipna=True)
-            
             ds = xr.Dataset({'rmse': rmse_map, 'bias': bias_map, 'mae': mae_map})
             return ds
         except Exception as e:
@@ -193,7 +171,11 @@ class MultiModelErrorAnalyzer:
 
     def calculate_regional_metrics(self, obs: xr.DataArray, fcst: xr.DataArray,
                                    region_bounds: Optional[Dict]) -> xr.Dataset:
-        """计算区域的月度、季节和年度指标 (RMSE, MAE, Bias)"""
+        """
+        计算区域指标:
+        1. 逐月时间序列 (Time Series): 保留 1993-2020 所有点。
+        2. 月度气候态 (Monthly Climatology): 1-12月平均。
+        """
         try:
             obs_reg = obs
             fcst_reg = fcst
@@ -206,56 +188,57 @@ class MultiModelErrorAnalyzer:
                 obs_reg = obs_reg.sel(lat=lat_slice, lon=slice(lon_b[0], lon_b[1]))
                 fcst_reg = fcst_reg.sel(lat=lat_slice, lon=slice(lon_b[0], lon_b[1]))
 
-            # 2. 计算空间加权平均的时间序列
+            # 2. 计算空间权重
             weights = np.cos(np.deg2rad(obs_reg.lat))
             weights.name = "weights"
 
-            diff = fcst_reg - obs_reg
-            diff_sq = diff ** 2
-            diff_abs = np.abs(diff)
-
-            # 空间平均 -> 得到时间序列
+            # 3. 计算逐月时间序列 (Time Series) - 对空间维度求平均
+            # MSE Series (Time) -> 用于后续算 RMSE
+            diff_sq = (fcst_reg - obs_reg) ** 2
             mse_ts = diff_sq.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
+            
+            # MAE Series (Time)
+            diff_abs = np.abs(fcst_reg - obs_reg)
             mae_ts = diff_abs.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
+            
+            # Bias Series (Time)
+            diff = fcst_reg - obs_reg
             bias_ts = diff.weighted(weights).mean(dim=['lat', 'lon'], skipna=True)
 
-            # 3. 按月份聚合 (1-12月)
-            rmse_mon = np.sqrt(mse_ts.groupby('time.month').mean('time'))
-            mae_mon = mae_ts.groupby('time.month').mean('time')
-            bias_mon = bias_ts.groupby('time.month').mean('time')
+            # 4. 计算月度气候态 (Monthly Climatology)
+            months = np.arange(1, 13)
+            
+            # RMSE Climatology = sqrt( mean(MSE_ts_for_month_m) )
+            mse_mon_mean = mse_ts.groupby('time.month').mean('time')
+            rmse_monthly = np.sqrt(mse_mon_mean).reindex(month=months) # 强制对齐 1-12
+            
+            # MAE/Bias Climatology
+            mae_monthly = mae_ts.groupby('time.month').mean('time').reindex(month=months)
+            bias_monthly = bias_ts.groupby('time.month').mean('time').reindex(month=months)
 
-            # 4. 按季节聚合
-            rmse_seas = np.sqrt(mse_ts.groupby('time.season').mean('time'))
-
-            # 5. 年度聚合
-            rmse_annual = np.sqrt(mse_ts.mean('time'))
-            mae_annual = mae_ts.mean('time')
-            bias_annual = bias_ts.mean('time')
-
-            # 标量 (供原有折线图 plot_line_metrics 使用)
-            rmse_val = float(rmse_annual.values) if hasattr(rmse_annual, 'values') else float(rmse_annual)
-            mae_val = float(mae_annual.values) if hasattr(mae_annual, 'values') else float(mae_annual)
-            bias_val = float(bias_annual.values) if hasattr(bias_annual, 'values') else float(bias_annual)
-
+            # 5. 保存结果
+            # 保存时间序列和月平均
             ds = xr.Dataset({
-                'rmse_monthly': rmse_mon,
-                'mae_monthly': mae_mon,
-                'bias_monthly': bias_mon,
-                'rmse_seasonal': rmse_seas,
-                'rmse_annual': rmse_annual,
-                'mae_annual': mae_annual,
-                'bias_annual': bias_annual,
-                'rmse': rmse_val,
-                'mae': mae_val,
-                'bias': bias_val,
+                # Time Series (保留更多信息)
+                'rmse_ts': np.sqrt(mse_ts), # 每个时间点的瞬时 RMSE
+                'mae_ts': mae_ts,
+                'bias_ts': bias_ts,
+                
+                # Monthly Climatology (用于绘图)
+                'rmse_monthly': rmse_monthly,
+                'mae_monthly': mae_monthly,
+                'bias_monthly': bias_monthly,
             })
+            
             return ds
         except Exception as e:
             logger.error(f"区域计算失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return None
 
     def save_spatial_maps(self, model_metric_maps: Dict, models: List[str], leadtimes: List[int]):
-        """保存空间图数据，供 --plot-only 时加载"""
+        """保存空间图数据"""
         for model in models:
             for lt in leadtimes:
                 if model not in model_metric_maps or lt not in model_metric_maps[model]:
@@ -272,24 +255,19 @@ class MultiModelErrorAnalyzer:
         for model in models:
             for lt in leadtimes:
                 fpath = self.spatial_map_dir / f"{model}_L{lt}.nc"
-                if not fpath.exists():
-                    logger.warning(f"未找到 {fpath}，跳过")
-                    continue
+                if not fpath.exists(): continue
                 try:
                     out[model][lt] = xr.open_dataset(fpath)
-                except Exception as e:
-                    logger.warning(f"加载失败 {fpath}: {e}")
+                except Exception: pass
         return out
 
     def save_region_metrics(self, region_metric_data: Dict, models: List[str]):
-        """保存区域指标数据，供 --plot-only 时加载"""
+        """保存区域指标数据"""
         for r_name in REGIONS:
-            if r_name not in region_metric_data:
-                continue
+            if r_name not in region_metric_data: continue
             for model in models:
                 ds_list = region_metric_data[r_name].get(model, [])
-                if not ds_list:
-                    continue
+                if not ds_list: continue
                 try:
                     combined = xr.concat(ds_list, dim='leadtime').sortby('leadtime')
                     fpath = self.region_metric_dir / f"{r_name}_{model}.nc"
@@ -303,26 +281,18 @@ class MultiModelErrorAnalyzer:
         for r_name in REGIONS:
             for model in models:
                 fpath = self.region_metric_dir / f"{r_name}_{model}.nc"
-                if not fpath.exists():
-                    continue
+                if not fpath.exists(): continue
                 try:
                     ds = xr.open_dataset(fpath)
                     for lt in ds.leadtime.values:
                         out[r_name][model].append(ds.sel(leadtime=lt))
-                except Exception as e:
-                    logger.warning(f"加载区域指标失败 {fpath}: {e}")
+                except Exception: pass
         return out
 
     def get_plotting_params(self, metric: str):
-        """
-        获取绘图参数 (Colormap, Levels, Norm, Extend)
-        """
+        """获取绘图参数"""
         n_bins = 20
-        
-        # 1. RMSE 和 MAE (非负值)
         if metric in ['rmse', 'mae']:
-            # 温度: White -> Red
-            # 降水: White -> Blue
             if self.var_type == 'temp':
                 colors = ['white'] + list(plt.get_cmap('Reds')(np.linspace(0, 1, n_bins)))
                 cmap = mcolors.LinearSegmentedColormap.from_list('WhiteReds', colors, N=n_bins)
@@ -333,20 +303,15 @@ class MultiModelErrorAnalyzer:
                 levels = np.linspace(0, 5, n_bins + 1)
             norm = mcolors.BoundaryNorm(levels, cmap.N)
             extend = 'max'
-            
-        # 2. Bias (有正负)
         elif metric == 'bias':
             if self.var_type == 'temp':
-                # 温度: <0 蓝 (冷), 0 白, >0 红 (暖)
                 cmap = plt.get_cmap('RdBu_r', n_bins) 
                 levels = np.linspace(-3, 3, n_bins + 1)
             else:
-                # 降水: <0 红 (干), 0 白, >0 蓝 (湿)
                 cmap = plt.get_cmap('RdBu', n_bins) 
                 levels = np.linspace(-3, 3, n_bins + 1)
             norm = mcolors.BoundaryNorm(levels, cmap.N)
             extend = 'both'
-            
         return cmap, levels, norm, extend
 
     def add_china_map_details(self, ax, data, lon, lat, levels, cmap, norm, extend):
@@ -357,7 +322,6 @@ class MultiModelErrorAnalyzer:
         ]
         hyd_path = self.boundaries_dir / "河流.shp"
         
-        # 河流
         if hyd_path.exists():
             try:
                 reader = shpreader.Reader(str(hyd_path))
@@ -369,7 +333,6 @@ class MultiModelErrorAnalyzer:
             
         ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
         
-        # 国界
         loaded = False
         for p in bou_paths:
             if p.exists():
@@ -382,7 +345,6 @@ class MultiModelErrorAnalyzer:
         if not loaded:
             ax.add_feature(cfeature.BORDERS, linewidth=1.0)
             
-        # 南海子图
         try:
             sub_ax = ax.inset_axes([0.7548, 0, 0.33, 0.35], projection=ccrs.PlateCarree())
             sub_ax.patch.set_facecolor('white')
@@ -421,7 +383,6 @@ class MultiModelErrorAnalyzer:
                 row_start = lt_idx * 2
                 ax_blank = fig.add_subplot(gs[row_start, 0]); ax_blank.axis('off')
                 
-                # 第一行
                 for col_idx in range(3):
                     if col_idx >= len(plot_models): break
                     self._plot_single_map(fig, gs, row_start, col_idx + 1, plot_models[col_idx], 
@@ -431,7 +392,6 @@ class MultiModelErrorAnalyzer:
                         ax = fig.axes[-1]
                         ax.text(0.98, 0.96, f'L{leadtime}', transform=ax.transAxes, 
                                fontsize=22, fontweight='bold', va='top', ha='right')
-                # 第二行
                 for col_idx in range(4):
                     model_idx = col_idx + 3
                     if model_idx >= len(plot_models): break
@@ -451,8 +411,6 @@ class MultiModelErrorAnalyzer:
             
         except Exception as e:
             logger.error(f"绘图失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
 
     def _plot_single_map(self, fig, gs, row, col, model, leadtime, maps, metric, cmap, levels, norm, extend, xticks, yticks, label_char):
         if leadtime not in maps[model]:
@@ -464,8 +422,6 @@ class MultiModelErrorAnalyzer:
 
         ax = fig.add_subplot(gs[row, col], projection=ccrs.PlateCarree())
         ax.set_extent([70, 140, 15, 55], crs=ccrs.PlateCarree())
-        
-        # 仅绘制陆地轮廓（海洋数据为NaN透明）
         ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
         
         gl = ax.gridlines(draw_labels=True, linewidth=0.5, linestyle='--')
@@ -479,89 +435,131 @@ class MultiModelErrorAnalyzer:
         
         self.add_china_map_details(ax, data, data.lon, data.lat, levels, cmap, norm, extend)
         
-        display_name = model.replace('-mon', '').replace('mon-', '')
+        display_name = model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')
         ax.text(0.02, 0.96, f"({label_char}) {display_name}", transform=ax.transAxes,
                fontsize=18, fontweight='bold', va='top')
 
-    def plot_line_metrics(self, region_metric_data: Dict, metric: str, is_global: bool = False):
-        """绘制折线图"""
+    def plot_monthly_metrics(self, region_metric_data: Dict, metric: str, is_global: bool = False):
+        """
+        绘制月度变化折线图 (按 Leadtime 分图)
+        """
         try:
-            if is_global:
-                regions = ['Global']
-                fig = plt.figure(figsize=(10, 6))
-                axes = {'Global': plt.gca()}
-                fname = f"global_{metric}_timeseries_{self.var_type}.png"
-                title_suffix = ""
-            else:
-                region_order = [
-                    'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
-                    'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
-                    'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
-                ]
-                regions = [r for r in region_order if r in region_metric_data]
-                if not regions: return
-                fig = plt.figure(figsize=(18, 15))
-                axes = {}
-                subplot_map = {
-                    'Z1-Northwest': (0,0), 'Z2-InnerMongolia': (0,1), 'Z3-Northeast': (0,2),
-                    'Z4-Tibetan': (1,0), 'Z5-NorthChina': (1,1), 'Z6-Yangtze': (1,2),
-                    'Z7-Southwest': (2,0), 'Z8-SouthChina': (2,1), 'Z9-SouthSea': (2,2)
-                }
-                for r in regions:
-                    row, col = subplot_map[r]
-                    axes[r] = plt.subplot(3, 3, row*3 + col + 1)
-                fname = f"regional_{metric}_timeseries_{self.var_type}.png"
-
-            cmap = plt.get_cmap('tab10')
-            all_vals = []
-            
-            for reg in regions:
-                if reg not in region_metric_data: continue
-                ax = axes[reg]
-                models_data = region_metric_data[reg]
+            # 遍历每个 Lead Time
+            for leadtime in LEADTIMES:
                 
-                for i, (model, ds_list) in enumerate(models_data.items()):
-                    if not ds_list: continue
-                    combined = xr.concat(ds_list, dim='leadtime').sortby('leadtime')
-                    if metric not in combined: continue
-                    y_vals = combined[metric].values
-                    x_vals = combined.leadtime.values
-                    all_vals.extend(y_vals)
-                    
-                    label = model.replace('-mon', '') if (is_global or reg == regions[0]) else ""
-                    ax.plot(x_vals, y_vals, marker='o', label=label, color=cmap(i % 10))
-                
-                if not is_global: ax.set_title(reg, fontweight='bold')
-                ax.grid(True, linestyle=':')
-                ax.set_xticks(LEADTIMES)
-                ax.set_xlabel('Lead Time (months)', fontsize=16)
-                ax.set_ylabel(f'{metric.upper()} ({self.unit_label})', fontsize=16)
-
-            # 统一Y轴
-            if all_vals:
-                ymin, ymax = min(all_vals), max(all_vals)
-                margin = (ymax - ymin) * 0.1
-                for ax in axes.values():
-                    lower = 0 if metric != 'bias' else ymin - margin
-                    ax.set_ylim(lower, ymax + margin)
-
-            # Legend
-            handles, labels = list(axes.values())[0].get_legend_handles_labels()
-            if handles:
+                # 初始化画布
                 if is_global:
-                    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=13, 
-                              bbox_to_anchor=(0.5, -0.05))
+                    regions = ['Global']
+                    fig = plt.figure(figsize=(10, 6))
+                    axes = {'Global': plt.gca()}
+                    fname = f"global_{metric}_monthly_L{leadtime}_{self.var_type}.png"
+                    title_suffix = f" (L{leadtime})"
                 else:
-                    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=18, 
-                              bbox_to_anchor=(0.5, -0.05))
+                    region_order = [
+                        'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
+                        'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
+                        'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+                    ]
+                    regions = [r for r in region_order if r in region_metric_data]
+                    if not regions: continue
+                    
+                    fig = plt.figure(figsize=(18, 15))
+                    axes = {}
+                    subplot_map = {
+                        'Z1-Northwest': (0,0), 'Z2-InnerMongolia': (0,1), 'Z3-Northeast': (0,2),
+                        'Z4-Tibetan': (1,0), 'Z5-NorthChina': (1,1), 'Z6-Yangtze': (1,2),
+                        'Z7-Southwest': (2,0), 'Z8-SouthChina': (2,1), 'Z9-SouthSea': (2,2)
+                    }
+                    for r in regions:
+                        row, col = subplot_map[r]
+                        axes[r] = plt.subplot(3, 3, row*3 + col + 1)
+                    fname = f"regional_{metric}_monthly_L{leadtime}_{self.var_type}.png"
+                    title_suffix = ""
 
-            plt.subplots_adjust(top=0.95, bottom=0.15 if is_global else 0.1, hspace=0.3, wspace=0.2)
-            plt.savefig(self.plot_dir / fname, dpi=300, bbox_inches='tight')
-            plt.close()
-            logger.info(f"{fname} 已保存")
+                cmap = plt.get_cmap('tab10')
+                all_vals = []
+                
+                # 绘图循环
+                for reg in regions:
+                    if reg not in region_metric_data: continue
+                    ax = axes[reg]
+                    models_data = region_metric_data[reg]
+                    
+                    for i, (model, ds_list) in enumerate(models_data.items()):
+                        # 找到对应 leadtime 的 dataset
+                        ds_lt = None
+                        for ds in ds_list:
+                            if 'leadtime' in ds and int(ds.leadtime) == leadtime:
+                                ds_lt = ds
+                                break
+                        
+                        if ds_lt is None: continue
+                        
+                        var_name = f"{metric}_monthly"
+                        if var_name not in ds_lt: continue
+                        
+                        da = ds_lt[var_name]
+                        
+                        # 健壮的数据获取 (Robust Fetch)
+                        if 'month' in da.coords:
+                             x_vals = da.month.values
+                             y_vals = da.values
+                        else:
+                             # 如果没有坐标，但大小为12，强制对齐
+                             if da.size == 12:
+                                 x_vals = np.arange(1, 13)
+                                 y_vals = da.values.flatten()
+                             else:
+                                 logger.warning(f"跳过 {reg} {model} L{leadtime}: 数据维度不正确 (size={da.size})")
+                                 continue
+                            
+                        # 确保只绘制有效值
+                        if len(x_vals) != len(y_vals):
+                             logger.warning(f"跳过 {reg} {model} L{leadtime}: x/y 长度不一致")
+                             continue
+                             
+                        all_vals.extend(y_vals[np.isfinite(y_vals)])
+                        
+                        label = model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC') if (is_global or reg == regions[0]) else ""
+                        ax.plot(x_vals, y_vals, marker='o', markersize=4, label=label, color=cmap(i % 10))
+                    
+                    if not is_global: 
+                        ax.set_title(f"{reg}", fontweight='bold')
+                    else:
+                        ax.set_title(f"Global {metric.upper()}{title_suffix}", fontweight='bold')
+                        
+                    ax.grid(True, linestyle=':')
+                    ax.set_xticks(range(1, 13))
+                    ax.set_xticklabels(MONTHS, rotation=45, fontsize=10)
+                    # ax.set_xlabel('Month', fontsize=12)
+                    ax.set_ylabel(f'{metric.upper()} ({self.unit_label})', fontsize=12)
+
+                # 统一Y轴
+                if all_vals:
+                    ymin, ymax = min(all_vals), max(all_vals)
+                    margin = (ymax - ymin) * 0.1 if ymax > ymin else 0.1
+                    for ax in axes.values():
+                        lower = 0 if metric != 'bias' else ymin - margin
+                        ax.set_ylim(lower, ymax + margin)
+
+                # Legend
+                if axes:
+                    handles, labels = list(axes.values())[0].get_legend_handles_labels()
+                    if handles:
+                        if is_global:
+                            fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=12, bbox_to_anchor=(0.5, -0.05))
+                        else:
+                            fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=16, bbox_to_anchor=(0.5, 0))
+
+                plt.subplots_adjust(top=0.95, bottom=0.15 if is_global else 0.1, hspace=0.35, wspace=0.25)
+                plt.savefig(self.plot_dir / fname, dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.info(f"{fname} 已保存")
 
         except Exception as e:
-            logger.error(f"折线图绘制失败: {e}")
+            logger.error(f"月度变化折线图绘制失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def run_analysis(self, models=None, leadtimes=None, parallel=False, n_jobs=None, plot_only=False):
         models = models or MODELS
@@ -618,9 +616,11 @@ class MultiModelErrorAnalyzer:
         self.plot_metric_spatial_maps(model_metric_maps, 'rmse', 'RMSE')
         self.plot_metric_spatial_maps(model_metric_maps, 'mae', 'MAE')
         self.plot_metric_spatial_maps(model_metric_maps, 'bias', 'Bias (Mean Error)')
+        
+        # 使用新的月度变化绘图函数替代原来的 Lead Time 折线图
         for m in ['rmse', 'mae', 'bias']:
-            self.plot_line_metrics(region_metric_data, m, is_global=True)
-            self.plot_line_metrics(region_metric_data, m, is_global=False)
+            self.plot_monthly_metrics(region_metric_data, m, is_global=True)
+            self.plot_monthly_metrics(region_metric_data, m, is_global=False)
 
 def _compute_errors_task(var_type, model, leadtime):
     try:

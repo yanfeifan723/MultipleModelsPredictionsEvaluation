@@ -700,7 +700,7 @@ class SeasonalMonthlyPearsonAnalyzer:
             
         acc_ds = maps[model][leadtime]
         data = acc_ds['temporal_acc']
-        display_name = model.replace('-mon', '').replace('mon-', '')
+        display_name = model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')
         
         ax = fig.add_subplot(gs[row, col], projection=ccrs.PlateCarree())
         ax.set_extent([70, 140, 15, 55], crs=ccrs.PlateCarree())
@@ -765,7 +765,7 @@ class SeasonalMonthlyPearsonAnalyzer:
                     if np.any(sig_mask):
                         ax.scatter(X_center[sig_mask], Y_center[sig_mask], marker='.', s=18, color='black', alpha=0.8)
 
-                ax.set_title(f"({chr(97+i)}) {model.replace('-mon', '').replace('mon-', '')}", fontsize=18, fontweight='bold', loc='left', pad=10)
+                ax.set_title(f"({chr(97+i)}) {model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')}", fontsize=18, fontweight='bold', loc='left', pad=10)
                 ax.set_xticks(months); ax.set_yticks(leadtimes)
                 ax.set_xlabel('Month', fontsize=16); ax.set_ylabel('Lead Time', fontsize=16)
                 ax.tick_params(axis='both', which='major', labelsize=14)
@@ -867,7 +867,7 @@ class SeasonalMonthlyPearsonAnalyzer:
                 x_vals = np.atleast_1d(mean_acc.leadtime.values)
                 y_vals = np.atleast_1d(mean_acc.values)
                 all_leadtimes.update(int(x) for x in mean_acc.leadtime.values)
-                ax.plot(x_vals, y_vals, marker='o', linewidth=2, label=model.replace('-mon', '').replace('mon-', ''), color=cmap(i % cmap.N))
+                ax.plot(x_vals, y_vals, marker='o', linewidth=2, label=model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC'), color=cmap(i % cmap.N))
 
             ax.set_ylabel('All Regions Mean ACC', fontsize=14)
             ax.set_xlabel('Lead Time', fontsize=14)
@@ -914,7 +914,7 @@ class SeasonalMonthlyPearsonAnalyzer:
                     combined_ds = xr.concat(model_data[model], dim='leadtime').sortby('leadtime')
                     da_mean = combined_ds['regional_index_acc'].mean(dim='month', skipna=True)
                     ax.plot(da_mean.leadtime.values, da_mean.values, marker='o', linewidth=2, markersize=6,
-                           label=model.replace('-mon', '').replace('mon-', '') if reg_name == regions[0] else "",
+                           label=model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC') if reg_name == regions[0] else "",
                            color=cmap(mi % cmap.N))
                 
                 ax.set_title(reg_name, fontsize=16, fontweight='bold')

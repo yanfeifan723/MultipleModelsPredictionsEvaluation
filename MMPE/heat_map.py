@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多区域三重指标(Bias, RMSE, ACC)组合热图绘制模块 (Fixed V9)
-修复与优化：
-1. 移除 MAE 指标绘制。
-2. 支持读取并绘制带显著性检验的季节性 ACC (Seasonal ACC & P-value)。
-3. 修复 Bias/ACC 在 extend='both' 时的 n_colors 计算错误。
-4. 优化 Bias 刻度：使用 MaxNLocator 生成以0为中心的整齐对称刻度。
-5. 增大所有刻度字体 (Heatmap axes & Colorbar ticks)。
-6. 减小 Regions Colorbar 宽度 (变细)。
+多区域三重指标(Bias, RMSE, ACC)组合热图绘制模块 (Fixed V10 - Robust Reading)
+功能升级：
+1. 增强数据读取鲁棒性：增加 _safe_get_value 函数，自动处理标量、0维数组或单维度数组，
+   防止因数据维度差异导致的读取错误。
+2. 优先读取预计算指标：对于 Seasonal 数据，优先读取 NetCDF 中的 _seasonal 变量，
+   确保与 combined_error_analysis.py 的精确计算保持一致。
+3. 保持特性：无 MAE，ECCC 别名，显著性打点。
 """
 
 import sys
@@ -61,13 +60,38 @@ class RegionalHeatMapPlotter:
         self.output_dir = Path(f"/sas12t1/ffyan/output/heat_map_regional/{var_type}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _safe_get_value(self, da, selector):
+        """
+        鲁棒的数据提取辅助函数
+        处理各种可能的维度情况：标量、0-d array、1-d array(size=1)
+        """
+        try:
+            subset = da.sel(**selector)
+            # 处理空数据
+            if subset.size == 0:
+                return np.nan
+            
+            vals = subset.values
+            # 如果是标量或0-d数组
+            if np.ndim(vals) == 0:
+                return float(vals.item())
+            
+            # 如果是数组，尝试 squeeze
+            vals = np.squeeze(vals)
+            if np.ndim(vals) == 0:
+                return float(vals.item())
+            
+            # 如果仍然是数组（理论上不应发生，除非 selector 选了多个点），取均值作为兜底
+            return float(np.nanmean(vals))
+        except Exception:
+            return np.nan
+
     def load_regional_data(self, region: str) -> Dict:
         """加载数据 (Bias, RMSE, ACC)"""
         data = {}
         safe_region = region.replace(' ', '_')
 
         for lt in LEADTIMES:
-            # 移除 'mae'
             data[lt] = {'bias': {}, 'rmse': {}, 'acc': {}}
 
             for model in MODEL_LIST:
@@ -82,35 +106,35 @@ class RegionalHeatMapPlotter:
                                 ds_lt = ds.sel(leadtime=int(lt))
                                 
                                 # --- Monthly ACC ---
-                                for m in range(1, 13):
-                                    m_name = MONTHS[m-1]
-                                    if m in ds_lt.month.values:
-                                        val = float(ds_lt.regional_index_acc.sel(month=m).values)
-                                        p_val = np.nan
-                                        if 'p_value' in ds_lt:
-                                            p_val = float(ds_lt.p_value.sel(month=m).values)
-                                        acc_entry['monthly'][m_name] = val
-                                        acc_entry['monthly_p'][m_name] = p_val
-                                    else:
-                                        acc_entry['monthly'][m_name] = np.nan
-                                        acc_entry['monthly_p'][m_name] = np.nan
+                                if 'regional_index_acc' in ds_lt:
+                                    da_acc = ds_lt['regional_index_acc']
+                                    da_p = ds_lt.get('p_value')
+                                    
+                                    for m in range(1, 13):
+                                        m_name = MONTHS[m-1]
+                                        acc_entry['monthly'][m_name] = self._safe_get_value(da_acc, {'month': m})
+                                        if da_p is not None:
+                                            acc_entry['monthly_p'][m_name] = self._safe_get_value(da_p, {'month': m})
+                                        else:
+                                            acc_entry['monthly_p'][m_name] = np.nan
                                 
-                                # --- Seasonal ACC (尝试读取预计算的季节性 ACC) ---
+                                # --- Seasonal ACC ---
                                 if 'regional_index_acc_seasonal' in ds_lt and 'season' in ds_lt.coords:
-                                    # 读取科学计算的季节 ACC 和 P 值
+                                    da_acc_seas = ds_lt['regional_index_acc_seasonal']
+                                    da_p_seas = ds_lt.get('p_value_seasonal')
+                                    
                                     for seas in SEASONS.keys():
                                         if seas in ds_lt.season.values:
-                                            val = float(ds_lt.regional_index_acc_seasonal.sel(season=seas).values)
-                                            p_val = np.nan
-                                            if 'p_value_seasonal' in ds_lt:
-                                                p_val = float(ds_lt.p_value_seasonal.sel(season=seas).values)
-                                            acc_entry['seasonal'][seas] = val
-                                            acc_entry['seasonal_p'][seas] = p_val
+                                            acc_entry['seasonal'][seas] = self._safe_get_value(da_acc_seas, {'season': seas})
+                                            if da_p_seas is not None:
+                                                acc_entry['seasonal_p'][seas] = self._safe_get_value(da_p_seas, {'season': seas})
+                                            else:
+                                                acc_entry['seasonal_p'][seas] = np.nan
                                         else:
                                             acc_entry['seasonal'][seas] = np.nan
                                             acc_entry['seasonal_p'][seas] = np.nan
                                 else:
-                                    # 回退逻辑：如果没有季节性变量，则使用月平均（无 p-value）
+                                    # 回退逻辑
                                     for seas, m_idxs in SEASONS.items():
                                         vals = [acc_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
                                         acc_entry['seasonal'][seas] = float(np.nanmean(vals))
@@ -121,7 +145,7 @@ class RegionalHeatMapPlotter:
                         # logger.warning(f"Failed loading ACC for {model} {lt}: {e}")
                         pass
 
-                # 2. Error Metrics (Bias, RMSE) - 移除 MAE
+                # 2. Error Metrics (Bias, RMSE)
                 err_file = self.error_base_dir / f"{region}_{model}.nc"
                 bias_entry = {'monthly': {}, 'seasonal': {}}
                 rmse_entry = {'monthly': {}, 'seasonal': {}}
@@ -133,34 +157,36 @@ class RegionalHeatMapPlotter:
                                 ds_lt = ds.sel(leadtime=int(lt))
                                 
                                 def extract_metric(ds_subset, metric_prefix, target_entry):
+                                    # Monthly
                                     var_mon = f"{metric_prefix}_monthly"
                                     if var_mon in ds_subset:
                                         da = ds_subset[var_mon]
-                                        month_coord = da.coords.get('month', getattr(ds_subset, 'month', list(range(1, 13))))
+                                        # 使用 _safe_get_value 安全提取
                                         for m in range(1, 13):
-                                            if m in month_coord:
-                                                val = da.sel(month=m).values
-                                                target_entry['monthly'][MONTHS[m-1]] = float(np.asarray(val).ravel()[0])
+                                            # 检查月份是否存在于坐标中
+                                            if 'month' in da.coords and m in da.month.values:
+                                                target_entry['monthly'][MONTHS[m-1]] = self._safe_get_value(da, {'month': m})
                                             else:
                                                 target_entry['monthly'][MONTHS[m-1]] = np.nan
                                     else:
                                         for m in MONTHS: target_entry['monthly'][m] = np.nan
 
+                                    # Seasonal (优先读取预计算的)
                                     var_seas = f"{metric_prefix}_seasonal"
                                     if var_seas in ds_subset and 'season' in ds_subset.dims:
+                                        da_seas = ds_subset[var_seas]
                                         for s in SEASONS.keys():
-                                            if s in ds_subset.season.values:
-                                                val = ds_subset[var_seas].sel(season=s).values
-                                                target_entry['seasonal'][s] = float(np.asarray(val).ravel()[0])
+                                            if s in da_seas.season.values:
+                                                target_entry['seasonal'][s] = self._safe_get_value(da_seas, {'season': s})
                                             else:
                                                 target_entry['seasonal'][s] = np.nan
                                     else:
+                                        # 回退逻辑
                                         for seas, m_idxs in SEASONS.items():
                                             vals = [target_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
                                             target_entry['seasonal'][seas] = float(np.nanmean(vals))
 
                                 extract_metric(ds_lt, 'bias', bias_entry)
-                                # extract_metric(ds_lt, 'mae', mae_entry) # 移除 MAE
                                 extract_metric(ds_lt, 'rmse', rmse_entry)
                                 
                                 data[lt]['bias'][model] = bias_entry
@@ -298,10 +324,9 @@ class RegionalHeatMapPlotter:
         if not models: return
 
         # 调整布局：2行 x 3列 (Bias, RMSE, ACC)
-        fig = plt.figure(figsize=(18, 12)) # 稍微调窄一点因为少了一列
+        fig = plt.figure(figsize=(18, 12)) 
         gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.05, wspace=0.05)
         
-        # 移除 'mae'
         vals = {m: [] for m in ['bias', 'rmse', 'acc']}
         for met in ['bias', 'rmse', 'acc']:
             for m in models:
