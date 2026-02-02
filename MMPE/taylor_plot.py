@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多模式Taylor图分析模块 (Fixed V3)
-修复说明：
-1. 修复 TaylorDiagram 初始化逻辑：区分 Subplot (网格) 和 Axes (绝对位置)。
-   当 rect 为 [left, bottom, width, height] 时使用 FloatingAxes + add_axes，避免 add_subplot 报错。
-2. 保持原有逻辑：加权指标计算、并行处理、NetCDF 保存。
+多模式Taylor图分析模块 (Fixed V4 - Global/Regions分离 & 多Leadtime同图)
+修改说明：
+1. 绘图重构：将 Global 和 Regions 分离为两个独立的绘图函数。
+2. 多维展示：在同一张图中展示所有 Lead Times。
+   - 颜色 (Color) -> 区分 Models
+   - 点型 (Marker) -> 区分 Lead Times
+3. 图例增强：分别展示 Model 颜色对应关系和 LeadTime 点型对应关系。
 """
 
 import sys
@@ -17,10 +19,11 @@ import xarray as xr
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
-# 添加 toolkit 路径 (仅用于数据加载和通用配置)
+# 添加 toolkit 路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "climate_analysis_toolkit"))
 from src.utils.data_loader import DataLoader
 from src.utils.logging_config import setup_logging
@@ -34,7 +37,7 @@ from common_config import (
 
 # 配置日志
 logger = setup_logging(
-    log_file='taylor_plot.log',
+    log_file='taylor_plot_v4.log',
     module_name=__name__
 )
 
@@ -55,28 +58,12 @@ def generate_regions():
     return regions
 
 REGIONS = generate_regions()
-MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 # =============================================================================
-# 内置 TaylorDiagram 实现
+# 内置 TaylorDiagram 实现 (保持不变)
 # =============================================================================
 class TaylorDiagram(object):
-    """
-    Taylor diagram implementation within the script.
-    Supports both subplot grid positioning and absolute positioning (rect).
-    """
-
     def __init__(self, refstd, fig=None, rect=111, label='_', srange=(0, 1.5), extend=False):
-        """
-        Set up Taylor diagram axes.
-        
-        Parameters:
-        - refstd: Reference standard deviation (usually 1.0 for normalized).
-        - fig: Input figure or None.
-        - rect: Subplot definition (int/SubplotSpec) OR [left, bottom, width, height].
-        - label: Reference label.
-        - srange: (min, max) for radial axis (stddev).
-        """
         from matplotlib.projections import PolarAxes
         import mpl_toolkits.axisartist.floating_axes as fa
         import mpl_toolkits.axisartist.grid_finder as gf
@@ -96,7 +83,6 @@ class TaylorDiagram(object):
         gl1 = gf.FixedLocator(t_locs)
         tf1 = gf.DictFormatter(dict(zip(t_locs, map(str, r_locs))))
 
-        # Standard deviation axis extent
         self.smin = srange[0]
         self.smax = srange[1]
 
@@ -110,20 +96,14 @@ class TaylorDiagram(object):
         if fig is None:
             fig = plt.figure()
 
-        # ---------------------------------------------------------------------
-        # 核心修复：根据 rect 类型选择 FloatingAxes 或 FloatingSubplot
-        # ---------------------------------------------------------------------
+        # 根据 rect 类型选择 FloatingAxes 或 FloatingSubplot
         if isinstance(rect, (list, tuple)) and len(rect) == 4:
-            # 绝对位置 [left, bottom, width, height] -> 使用 FloatingAxes + add_axes
             ax = fa.FloatingAxes(fig, rect, grid_helper=ghelper)
             fig.add_axes(ax)
         else:
-            # 网格位置 (e.g. 111) -> 使用 FloatingSubplot + add_subplot
             ax = fa.FloatingSubplot(fig, rect, grid_helper=ghelper)
             fig.add_subplot(ax)
-        # ---------------------------------------------------------------------
 
-        # Adjust axes
         ax.axis["top"].set_axis_direction("bottom")
         ax.axis["top"].toggle(ticklabels=True, label=True)
         ax.axis["top"].major_ticklabels.set_axis_direction("top")
@@ -144,47 +124,34 @@ class TaylorDiagram(object):
         self._ax = ax
         self.ax = ax.get_aux_axes(tr)
 
-        # Add reference point and circle
         l, = self.ax.plot([0], self.refstd, 'k*', ls='', ms=10, label=label)
         t = np.linspace(0, self.tmax)
         r = np.zeros_like(t) + self.refstd
         self.ax.plot(t, r, 'k--', label='_')
 
-        # Grid lines
         self.samplePoints = [l]
         self.ax.grid(True, linestyle=':')
 
     def add_sample(self, stddev, corrcoef, *args, **kwargs):
-        """Add sample points (r, theta)."""
         l, = self.ax.plot(np.arccos(corrcoef), stddev, *args, **kwargs)
         self.samplePoints.append(l)
         return l
 
-    def add_grid(self, *args, **kwargs):
-        """Add a grid."""
-        self._ax.grid(*args, **kwargs)
-
     def add_contours(self, levels=5, **kwargs):
-        """Add centered RMSE contours."""
         rs, ts = np.meshgrid(np.linspace(self.smin, self.smax),
                              np.linspace(0, self.tmax))
-        # Centered RMSE = sqrt(r^2 + ref^2 - 2*r*ref*cos(theta))
         rms = np.sqrt(self.refstd**2 + rs**2 - 2*self.refstd*rs*np.cos(ts))
-
         contours = self.ax.contour(ts, rs, rms, levels, **kwargs)
         return contours
 
 # =============================================================================
-# 指标计算逻辑
+# 指标计算逻辑 (保持不变)
 # =============================================================================
 def calculate_weighted_metrics(obs_da: xr.DataArray, mod_da: xr.DataArray, region_bounds=None) -> dict:
-    """计算加权泰勒图指标 (Correlation, Std Ratio, RMSE)"""
     try:
-        # 1. 区域截取
         if region_bounds is not None:
             lat_b = region_bounds['lat']
             lon_b = region_bounds['lon']
-            # 处理纬度切片顺序
             if obs_da.lat[0] < obs_da.lat[-1]:
                 lat_slice = slice(lat_b[0], lat_b[1])
             else:
@@ -196,11 +163,9 @@ def calculate_weighted_metrics(obs_da: xr.DataArray, mod_da: xr.DataArray, regio
             obs_sub = obs_da
             mod_sub = mod_da
 
-        # 2. 计算权重 (cos(lat))
         weights = np.cos(np.deg2rad(obs_sub.lat))
         weights_broad = xr.broadcast(weights, obs_sub)[0]
 
-        # 3. 展平数组
         obs_flat = obs_sub.values.flatten()
         mod_flat = mod_sub.values.flatten()
         w_flat = weights_broad.values.flatten()
@@ -213,29 +178,22 @@ def calculate_weighted_metrics(obs_da: xr.DataArray, mod_da: xr.DataArray, regio
         m = mod_flat[valid_mask]
         w = w_flat[valid_mask]
 
-        # 4. 计算加权统计量
-        # 加权均值
         mean_o = np.average(o, weights=w)
         mean_m = np.average(m, weights=w)
         
-        # 去中心化 (Centered Pattern)
         o_anom = o - mean_o
         m_anom = m - mean_m
         
-        # 加权标准差
         var_o = np.average(o_anom**2, weights=w)
         var_m = np.average(m_anom**2, weights=w)
         std_o = np.sqrt(var_o)
         std_m = np.sqrt(var_m)
         
-        # 加权相关系数
         cov = np.average(o_anom * m_anom, weights=w)
         corr = cov / (std_o * std_m) if (std_o > 0 and std_m > 0) else np.nan
         
-        # 归一化标准差比
         std_ratio = std_m / std_o if std_o > 0 else np.nan
         
-        # 加权中心化 RMSE (归一化)
         if std_o > 0 and np.isfinite(std_ratio) and np.isfinite(corr):
             crmse_norm = np.sqrt(max(0, 1 + std_ratio**2 - 2 * std_ratio * corr))
         else:
@@ -264,14 +222,12 @@ class TaylorAnalyzer:
             p.mkdir(parents=True, exist_ok=True)
 
     def load_and_preprocess(self, model: str, leadtime: int):
-        """加载并预处理数据 (计算月距平)"""
+        # 保持原有数据加载逻辑不变
         try:
-            # 加载观测
             obs_data = self.data_loader.load_obs_data(self.var_type)
             obs_data = obs_data.resample(time='1MS').mean()
             obs_data = obs_data.sel(time=slice('1993', '2020'))
 
-            # 加载模式 (Ensemble Mean)
             fcst_data = self.data_loader.load_forecast_data_ensemble(model, self.var_type, leadtime)
             if fcst_data is None: return None, None
             
@@ -281,17 +237,14 @@ class TaylorAnalyzer:
             fcst_data = fcst_data.resample(time='1MS').mean()
             fcst_data = fcst_data.sel(time=slice('1993', '2020'))
             
-            # 对齐
             common_times = obs_data.time.to_index().intersection(fcst_data.time.to_index())
             if len(common_times) < 12: return None, None
             
             obs_aligned = obs_data.sel(time=common_times)
             fcst_aligned = fcst_data.sel(time=common_times)
             
-            # 插值
             fcst_interp = fcst_aligned.interp(lat=obs_aligned.lat, lon=obs_aligned.lon, method='linear')
             
-            # 计算距平
             obs_clim = obs_aligned.groupby('time.month').mean('time')
             obs_anom = obs_aligned.groupby('time.month') - obs_clim
             
@@ -304,7 +257,7 @@ class TaylorAnalyzer:
             return None, None
 
     def compute_metrics_task(self, model, leadtime, seasons):
-        """计算任务"""
+        # 保持原有计算任务逻辑不变
         obs_anom, fcst_anom = self.load_and_preprocess(model, leadtime)
         if obs_anom is None: return None
         
@@ -313,8 +266,6 @@ class TaylorAnalyzer:
         
         for season in season_list:
             results[season] = {}
-            
-            # 时间筛选
             if season == 'annual':
                 obs_season = obs_anom
                 fcst_season = fcst_anom
@@ -354,12 +305,15 @@ class TaylorAnalyzer:
                 if res: self._organize_results(final_data, res)
 
         self.save_metrics(final_data)
-        self.plot_all(final_data)
+        
+        # 将所有 leadtimes 传递给绘图函数，不再循环单独调用
+        self.plot_all(final_data, leadtimes, models)
 
     def _organize_results(self, final_data, res):
         model, leadtime, season_results = res
         for season, reg_dict in season_results.items():
             if season not in final_data: final_data[season] = {}
+            # 注意结构：final_data[season][leadtime][reg][model]
             if leadtime not in final_data[season]: final_data[season][leadtime] = {}
             
             for reg, metrics in reg_dict.items():
@@ -388,74 +342,166 @@ class TaylorAnalyzer:
             ds.to_netcdf(out_file)
             logger.info(f"Saved metrics: {out_file}")
 
-    def plot_all(self, data):
-        for season, lt_data in data.items():
-            for lt, reg_data in lt_data.items():
-                self.plot_combined_taylor(season, lt, reg_data)
+    # =========================================================================
+    # 新的绘图逻辑部分
+    # =========================================================================
+    def plot_all(self, data, leadtimes, models):
+        """
+        data: final_data[season][leadtime][reg][model]
+        """
+        # 准备样式
+        # 1. Models 用颜色区分
+        cmap = plt.cm.get_cmap('tab10')
+        colors = [cmap(i) for i in np.linspace(0, 1, 10)]
+        model_colors = {m: colors[i % len(colors)] for i, m in enumerate(models)}
+        
+        # 2. Leadtimes 用点型区分
+        # 常用点型: 圆圈, 正方形, 三角形, 钻石, 倒三角, 左三角, 右三角, 五边形, 星形, X
+        markers_list = ['o', 's', '^', 'D', 'v', '<', '>', 'P', '*', 'X']
+        # 对 leadtimes 进行排序以保证图例顺序一致
+        sorted_lts = sorted(leadtimes)
+        lt_markers = {lt: markers_list[i % len(markers_list)] for i, lt in enumerate(sorted_lts)}
 
-    def plot_combined_taylor(self, season, leadtime, reg_data):
-        regions_ordered = ['Global'] + [
+        for season, lt_data in data.items():
+            # 这里我们需要重组数据以便于绘图：按 [Region] -> [Leadtime] -> [Model] 访问
+            # 但原始结构是 [Leadtime][Region][Model]
+            # 为了方便，我们在绘图函数内部遍历
+            
+            # 1. 绘制 Global 单张图
+            self.plot_global_only(season, data[season], model_colors, lt_markers)
+            
+            # 2. 绘制 Regions 九宫格
+            self.plot_regions_grid(season, data[season], model_colors, lt_markers)
+
+    def _create_common_legend(self, fig, model_colors, lt_markers):
+        """创建组合图例：分两列，一列Models，一列Leadtimes"""
+        handles = []
+        labels = []
+        
+        # Model Legend (Color only, invisible marker or simple dot)
+        handles.append(Line2D([0], [0], color='w', label='[ Models ]', marker=None)) # Title
+        labels.append(r"$\bf{Models}$")
+        
+        for m_name, color in model_colors.items():
+            display_name = m_name.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')
+            h = Line2D([0], [0], color=color, marker='o', linestyle='', markersize=8)
+            handles.append(h)
+            labels.append(display_name)
+            
+        # Spacer
+        handles.append(Line2D([0], [0], color='w', label=' ', marker=None))
+        labels.append(" ")
+        
+        # Leadtime Legend (Black color, varies marker)
+        handles.append(Line2D([0], [0], color='w', label='[ Lead Times ]', marker=None))
+        labels.append(r"$\bf{Lead\ Times}$")
+        
+        for lt, marker in lt_markers.items():
+            h = Line2D([0], [0], color='k', marker=marker, linestyle='', markersize=8)
+            handles.append(h)
+            labels.append(f"Lead {lt}")
+
+        # 将图例放在底部，自动换行
+        # 为了美观，可以分两个Legend，或者计算好列数
+        # 这里使用简单的一行多列流式布局
+        fig.legend(handles, labels, loc='lower center', ncol=min(6, len(handles)), 
+                   bbox_to_anchor=(0.5, 0.02), fontsize=12, frameon=True)
+
+    def plot_global_only(self, season, season_data, model_colors, lt_markers):
+        """单独绘制 Global 区域"""
+        reg_name = 'Global'
+        
+        fig = plt.figure(figsize=(10, 10))
+        # 留出底部给图例
+        rect = [0.1, 0.2, 0.8, 0.7] 
+        
+        td = TaylorDiagram(refstd=1.0, fig=fig, rect=rect, label='Obs', srange=(0, 1.6))
+        td.add_contours(levels=5, colors='gray', alpha=0.4)
+        
+        plotted_any = False
+        
+        # season_data 结构: {leadtime: {region: {model: metrics}}}
+        for lt, reg_dict in season_data.items():
+            if reg_name not in reg_dict: continue
+            
+            marker = lt_markers.get(lt, 'o')
+            metrics_dict = reg_dict[reg_name]
+            
+            for model, met in metrics_dict.items():
+                color = model_colors.get(model, 'k')
+                
+                if np.isfinite(met['corr']) and np.isfinite(met['std_ratio']):
+                    td.add_sample(met['std_ratio'], met['corr'], 
+                                  color=color, marker=marker, markersize=12, 
+                                  label="_nolegend_") # 图例单独画
+                    plotted_any = True
+
+        if not plotted_any:
+            plt.close(fig)
+            return
+
+        td._ax.set_title(f"Global - {self.var_type.upper()} ({season})", fontsize=18, fontweight='bold', y=1.08)
+        
+        self._create_common_legend(fig, model_colors, lt_markers)
+        
+        out_file = self.plot_dir / f"taylor_Global_{self.var_type}_{season}_multilead.png"
+        plt.savefig(out_file, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Global plot saved: {out_file}")
+
+    def plot_regions_grid(self, season, season_data, model_colors, lt_markers):
+        """绘制除 Global 外的区域 (九宫格)"""
+        regions_ordered = [
             'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
             'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
             'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
         ]
         
         fig = plt.figure(figsize=(20, 24))
-        gs = GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3, top=0.92, bottom=0.05)
+        # 调整底部空间以容纳更大的图例
+        gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3, top=0.92, bottom=0.15)
         
-        valid_plot = False
-        colors = plt.cm.tab10(np.linspace(0, 1, 10))
-        markers = ['o', 's', '^', 'D', 'v', '<', '>', 'P', '*', 'X']
-        model_style = {}
+        plotted_any = False
         
         for i, reg_name in enumerate(regions_ordered):
-            if reg_name not in reg_data: continue
-            valid_plot = True
-            
-            # 获取 GridSpec 的位置坐标 [x, y, w, h]
+            # 获取 subplot 位置
             ax_spec = gs[i // 3, i % 3]
             bbox = ax_spec.get_position(fig)
             rect = [bbox.x0, bbox.y0, bbox.width, bbox.height]
             
-            # 使用 rect 初始化 TaylorDiagram (自动调用 FloatingAxes)
             td = TaylorDiagram(refstd=1.0, fig=fig, rect=rect, label='Obs', srange=(0, 1.6))
-            td.add_contours(levels=5, colors='gray', alpha=0.4) 
-            
-            metrics_dict = reg_data[reg_name]
-            for model, met in metrics_dict.items():
-                if model not in model_style:
-                    model_style[model] = (colors[len(model_style) % 10], markers[len(model_style) % 10])
-                c, m = model_style[model]
-                
-                if np.isfinite(met['corr']) and np.isfinite(met['std_ratio']):
-                    td.add_sample(met['std_ratio'], met['corr'], 
-                                  color=c, marker=m, markersize=10, 
-                                  label=model if i == 0 else "_nolegend_")
-            
+            td.add_contours(levels=5, colors='gray', alpha=0.4)
             td._ax.set_title(f"{reg_name}", fontsize=14, fontweight='bold', y=1.05)
-
-        if not valid_plot: 
+            
+            # 遍历所有 Leadtime 和 Model
+            for lt, reg_dict in season_data.items():
+                if reg_name not in reg_dict: continue
+                
+                marker = lt_markers.get(lt, 'o')
+                metrics_dict = reg_dict[reg_name]
+                
+                for model, met in metrics_dict.items():
+                    color = model_colors.get(model, 'k')
+                    
+                    if np.isfinite(met['corr']) and np.isfinite(met['std_ratio']):
+                        td.add_sample(met['std_ratio'], met['corr'], 
+                                      color=color, marker=marker, markersize=10, 
+                                      label="_nolegend_")
+                        plotted_any = True
+        
+        if not plotted_any:
             plt.close(fig)
             return
 
-        handles = []
-        labels = []
-        for model, (c, m) in model_style.items():
-            h = plt.Line2D([0], [0], color=c, marker=m, linestyle='', markersize=10)
-            handles.append(h)
-            display_name = model.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')
-            labels.append(display_name)
-            
-        fig.legend(handles, labels, loc='lower center', ncol=min(5, len(labels)), 
-                   bbox_to_anchor=(0.5, 0.01), fontsize=14, frameon=True)
+        fig.suptitle(f"Regional Performance ({self.var_type.upper()}) - {season}", 
+                     fontsize=24, fontweight='bold', y=0.96)
         
-        fig.suptitle(f"Space-Time Taylor Diagram ({self.var_type.upper()}) - {season} L{leadtime}", 
-                     fontsize=20, fontweight='bold', y=0.97)
+        self._create_common_legend(fig, model_colors, lt_markers)
         
-        out_file = self.plot_dir / f"taylor_combined_{self.var_type}_{season}_L{leadtime}.png"
+        out_file = self.plot_dir / f"taylor_Regions_{self.var_type}_{season}_multilead.png"
         plt.savefig(out_file, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"Plot saved: {out_file}")
+        logger.info(f"Regions plot saved: {out_file}")
 
 def main():
     parser = create_parser(
