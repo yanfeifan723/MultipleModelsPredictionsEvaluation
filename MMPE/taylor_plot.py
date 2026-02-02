@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多模式Taylor图分析模块 (Fixed V2)
+多模式Taylor图分析模块 (Fixed V3)
 修复说明：
-1. 修复参数解析错误：添加 include_seasons=True。
-2. 移除 toolkit 绘图依赖：内置 TaylorDiagram 类实现。
-3. 增强健壮性：优化指标计算和绘图布局。
+1. 修复 TaylorDiagram 初始化逻辑：区分 Subplot (网格) 和 Axes (绝对位置)。
+   当 rect 为 [left, bottom, width, height] 时使用 FloatingAxes + add_axes，避免 add_subplot 报错。
+2. 保持原有逻辑：加权指标计算、并行处理、NetCDF 保存。
 """
 
 import sys
@@ -17,9 +17,6 @@ import xarray as xr
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from matplotlib.projections import PolarAxes
-import mpl_toolkits.axisartist.floating_axes as fa
-import mpl_toolkits.axisartist.grid_finder as gf
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
@@ -61,12 +58,12 @@ REGIONS = generate_regions()
 MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 # =============================================================================
-# 内置 TaylorDiagram 实现 (替代 toolkit)
+# 内置 TaylorDiagram 实现
 # =============================================================================
 class TaylorDiagram(object):
     """
-    Taylor diagram implementation within the script to avoid toolkit dependencies.
-    Plot model standard deviation and correlation to reference (observation).
+    Taylor diagram implementation within the script.
+    Supports both subplot grid positioning and absolute positioning (rect).
     """
 
     def __init__(self, refstd, fig=None, rect=111, label='_', srange=(0, 1.5), extend=False):
@@ -76,7 +73,7 @@ class TaylorDiagram(object):
         Parameters:
         - refstd: Reference standard deviation (usually 1.0 for normalized).
         - fig: Input figure or None.
-        - rect: Subplot definition.
+        - rect: Subplot definition (int/SubplotSpec) OR [left, bottom, width, height].
         - label: Reference label.
         - srange: (min, max) for radial axis (stddev).
         """
@@ -90,11 +87,9 @@ class TaylorDiagram(object):
         # Correlation labels
         r_locs = np.array([0, 0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1])
         if extend:
-            # Diagram extended to negative correlations
             self.tmax = np.pi
             r_locs = np.concatenate((-r_locs[:0:-1], r_locs))
         else:
-            # Diagram limited to positive correlations
             self.tmax = np.pi/2
 
         t_locs = np.arccos(r_locs)
@@ -115,8 +110,18 @@ class TaylorDiagram(object):
         if fig is None:
             fig = plt.figure()
 
-        ax = fa.FloatingSubplot(fig, rect, grid_helper=ghelper)
-        fig.add_subplot(ax)
+        # ---------------------------------------------------------------------
+        # 核心修复：根据 rect 类型选择 FloatingAxes 或 FloatingSubplot
+        # ---------------------------------------------------------------------
+        if isinstance(rect, (list, tuple)) and len(rect) == 4:
+            # 绝对位置 [left, bottom, width, height] -> 使用 FloatingAxes + add_axes
+            ax = fa.FloatingAxes(fig, rect, grid_helper=ghelper)
+            fig.add_axes(ax)
+        else:
+            # 网格位置 (e.g. 111) -> 使用 FloatingSubplot + add_subplot
+            ax = fa.FloatingSubplot(fig, rect, grid_helper=ghelper)
+            fig.add_subplot(ax)
+        # ---------------------------------------------------------------------
 
         # Adjust axes
         ax.axis["top"].set_axis_direction("bottom")
@@ -231,7 +236,6 @@ def calculate_weighted_metrics(obs_da: xr.DataArray, mod_da: xr.DataArray, regio
         std_ratio = std_m / std_o if std_o > 0 else np.nan
         
         # 加权中心化 RMSE (归一化)
-        # E'^2 = 1 + sigma_hat^2 - 2 * sigma_hat * R
         if std_o > 0 and np.isfinite(std_ratio) and np.isfinite(corr):
             crmse_norm = np.sqrt(max(0, 1 + std_ratio**2 - 2 * std_ratio * corr))
         else:
@@ -244,7 +248,6 @@ def calculate_weighted_metrics(obs_da: xr.DataArray, mod_da: xr.DataArray, regio
             'ref_std': 1.0 
         }
     except Exception as e:
-        # logger.debug(f"Metrics calculation failed: {e}")
         return {'corr': np.nan, 'std_ratio': np.nan, 'crmse': np.nan}
 
 class TaylorAnalyzer:
@@ -409,30 +412,14 @@ class TaylorAnalyzer:
             if reg_name not in reg_data: continue
             valid_plot = True
             
-            # TaylorDiagram (rect=[left, bottom, width, height] or integer)
-            # GridSpec gives us axes, but TaylorDiagram creates its own FloatingSubplot.
-            # We need to compute rect from GridSpec slot.
-            
+            # 获取 GridSpec 的位置坐标 [x, y, w, h]
             ax_spec = gs[i // 3, i % 3]
-            # Use matplotlib layout mechanism to place TaylorDiagram
-            # This is tricky with FloatingAxes. A robust way is to pass the subplotspec or a new figure.
-            # Here we pass 'rect' as the subplot position in a slightly simpler way:
-            # We create the TaylorDiagram on the figure.
-            
-            # Note: TaylorDiagram implementation expects 'rect' to be 3-digit int or a list.
-            # Since we have 12 plots, we can't use 3-digit int easily for all.
-            # We will use the GridSpec to get the bounding box.
-            
-            # IMPORTANT: FloatingSubplot is complex to use with GridSpec directly.
-            # Simpler alternative: Create the TaylorDiagram as a standalone subplot
-            # occupying the position.
-            
-            # Let's use the layout engine to determine position
             bbox = ax_spec.get_position(fig)
             rect = [bbox.x0, bbox.y0, bbox.width, bbox.height]
             
+            # 使用 rect 初始化 TaylorDiagram (自动调用 FloatingAxes)
             td = TaylorDiagram(refstd=1.0, fig=fig, rect=rect, label='Obs', srange=(0, 1.6))
-            td.add_contours(levels=5, colors='gray', alpha=0.4) # Add RMSE contours
+            td.add_contours(levels=5, colors='gray', alpha=0.4) 
             
             metrics_dict = reg_data[reg_name]
             for model, met in metrics_dict.items():
@@ -445,8 +432,6 @@ class TaylorAnalyzer:
                                   color=c, marker=m, markersize=10, 
                                   label=model if i == 0 else "_nolegend_")
             
-            # Title needs to be added to the figure or axis
-            # td._ax is the underlying Axes
             td._ax.set_title(f"{reg_name}", fontsize=14, fontweight='bold', y=1.05)
 
         if not valid_plot: 
@@ -473,7 +458,6 @@ class TaylorAnalyzer:
         logger.info(f"Plot saved: {out_file}")
 
 def main():
-    # 关键修复: include_seasons=True
     parser = create_parser(
         description="Taylor Diagram Analysis (Space-Time Patterns)", 
         include_seasons=True
