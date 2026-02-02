@@ -285,12 +285,21 @@ class TaylorAnalyzer:
                 
         return (model, leadtime, results)
 
-    def run_analysis(self, models, leadtimes, seasons, parallel=True):
+    def run_analysis(self, models, leadtimes, seasons, parallel=True, plot_only=False, no_plot=False):
+        if plot_only:
+            final_data, models_loaded, leadtimes_loaded = self.load_metrics(seasons)
+            if not final_data:
+                logger.warning("Plot-only: no saved metrics found, skip plotting.")
+                return
+            logger.info(f"Plot-only: loaded metrics for {self.var_type}, seasons={list(final_data.keys())}")
+            self.plot_all(final_data, leadtimes_loaded, models_loaded)
+            return
+
         tasks = [(m, lt, seasons) for lt in leadtimes for m in models]
         final_data = {}
-        
+
         logger.info(f"Start Taylor analysis for {self.var_type}...")
-        
+
         if parallel:
             max_workers = min(self.n_jobs or cpu_count(), 32)
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -305,9 +314,9 @@ class TaylorAnalyzer:
                 if res: self._organize_results(final_data, res)
 
         self.save_metrics(final_data)
-        
-        # 将所有 leadtimes 传递给绘图函数，不再循环单独调用
-        self.plot_all(final_data, leadtimes, models)
+
+        if not no_plot:
+            self.plot_all(final_data, leadtimes, models)
 
     def _organize_results(self, final_data, res):
         model, leadtime, season_results = res
@@ -341,6 +350,38 @@ class TaylorAnalyzer:
             out_file = self.data_dir / f"metrics_taylor_{self.var_type}_{season}.nc"
             ds.to_netcdf(out_file)
             logger.info(f"Saved metrics: {out_file}")
+
+    def load_metrics(self, seasons):
+        """从已保存的 NetCDF 加载指标，用于 --plot-only。返回 final_data, models, leadtimes。"""
+        final_data = {}
+        all_models = set()
+        all_leadtimes = set()
+        for season in seasons:
+            out_file = self.data_dir / f"metrics_taylor_{self.var_type}_{season}.nc"
+            if not out_file.exists():
+                logger.warning(f"Plot-only: file not found, skip season {season}: {out_file}")
+                continue
+            ds = xr.open_dataset(out_file)
+            final_data[season] = {}
+            for lt in ds.coords['leadtime'].values:
+                lt_int = int(lt)
+                all_leadtimes.add(lt_int)
+                final_data[season][lt_int] = {}
+                for reg in ds.coords['region'].values:
+                    reg_str = str(reg) if not isinstance(reg, str) else reg
+                    final_data[season][lt_int][reg_str] = {}
+                    for mod in ds.coords['model'].values:
+                        mod_str = str(mod) if not isinstance(mod, str) else mod
+                        all_models.add(mod_str)
+                        final_data[season][lt_int][reg_str][mod_str] = {
+                            'corr': float(ds['corr'].sel(leadtime=lt, region=reg, model=mod).values),
+                            'std_ratio': float(ds['std_ratio'].sel(leadtime=lt, region=reg, model=mod).values),
+                            'crmse': float(ds['crmse'].sel(leadtime=lt, region=reg, model=mod).values)
+                        }
+            ds.close()
+        models = sorted(all_models)
+        leadtimes = sorted(all_leadtimes)
+        return final_data, models, leadtimes
 
     # =========================================================================
     # 新的绘图逻辑部分
@@ -440,7 +481,7 @@ class TaylorAnalyzer:
             plt.close(fig)
             return
 
-        td._ax.set_title(f"Global - {self.var_type.upper()} ({season})", fontsize=18, fontweight='bold', y=1.08)
+        # td._ax.set_title(f"Global - {self.var_type.upper()} ({season})", fontsize=18, fontweight='bold', y=1.08)
         
         self._create_common_legend(fig, model_colors, lt_markers)
         
@@ -457,7 +498,7 @@ class TaylorAnalyzer:
             'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
         ]
         
-        fig = plt.figure(figsize=(20, 24))
+        fig = plt.figure(figsize=(20, 23))
         # 调整底部空间以容纳更大的图例
         gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3, top=0.92, bottom=0.15)
         
@@ -493,8 +534,8 @@ class TaylorAnalyzer:
             plt.close(fig)
             return
 
-        fig.suptitle(f"Regional Performance ({self.var_type.upper()}) - {season}", 
-                     fontsize=24, fontweight='bold', y=0.96)
+        # fig.suptitle(f"Regional Performance ({self.var_type.upper()}) - {season}", 
+        #              fontsize=24, fontweight='bold', y=0.96)
         
         self._create_common_legend(fig, model_colors, lt_markers)
         
@@ -505,27 +546,40 @@ class TaylorAnalyzer:
 
 def main():
     parser = create_parser(
-        description="Taylor Diagram Analysis (Space-Time Patterns)", 
-        include_seasons=True
+        description="Taylor图分析（空间-时间型）",
+        include_seasons=True,
+        var_default=None,
+        var_required=False
     )
     args = parser.parse_args()
-    
+
     models = parse_models(args.models, MODEL_LIST) if args.models else MODEL_LIST
     leadtimes = parse_leadtimes(args.leadtimes, LEADTIMES) if args.leadtimes else LEADTIMES
     var_list = parse_vars(args.var) if args.var else ['temp', 'prec']
-    
+
     seasons = []
-    if args.seasons:
+    if getattr(args, 'all_seasons', False):
+        seasons = list(SEASONS.keys())
+    elif getattr(args, 'seasons', None):
         if 'all' in args.seasons:
             seasons = list(SEASONS.keys())
         else:
             seasons = [s for s in args.seasons if s in SEASONS]
-    
-    parallel = normalize_parallel_args(args)
-    
+    if not seasons:
+        seasons = list(SEASONS.keys())
+
+    parallel = normalize_parallel_args(args) or (args.n_jobs is not None and args.n_jobs > 1)
+
     for var in var_list:
         analyzer = TaylorAnalyzer(var, n_jobs=args.n_jobs)
-        analyzer.run_analysis(models, leadtimes, seasons, parallel=parallel)
+        analyzer.run_analysis(
+            models=models,
+            leadtimes=leadtimes,
+            seasons=seasons,
+            parallel=parallel,
+            plot_only=args.plot_only,
+            no_plot=args.no_plot
+        )
 
 if __name__ == "__main__":
     main()
