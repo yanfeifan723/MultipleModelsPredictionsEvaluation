@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多模式Taylor图分析模块 (Fixed V4 - Global/Regions分离 & 多Leadtime同图)
+多模式Taylor图分析模块 (Fixed V5 - Split Leadtime & Season Markers)
 修改说明：
-1. 绘图重构：将 Global 和 Regions 分离为两个独立的绘图函数。
-2. 多维展示：在同一张图中展示所有 Lead Times。
-   - 颜色 (Color) -> 区分 Models
-   - 点型 (Marker) -> 区分 Lead Times
-3. 图例增强：分别展示 Model 颜色对应关系和 LeadTime 点型对应关系。
+1. 绘图重构：
+   - 不同的 Lead Time 保存为不同的图像文件 (Files separated by Lead Time).
+   - 同一张图中：
+     * 颜色 (Color) -> 区分 Models
+     * 点型 (Marker) -> 区分 Seasons (Annual, DJF, MAM, JJA, SON)
+2. 数据计算与保存：
+   - 计算 Annual, Seasonal, 以及 Monthly (Jan-Dec) 的指标。
+   - 保存为包含 'season' 维度的 NetCDF 格式，单文件 metrics_taylor_{var}_all.nc。
 """
 
 import sys
@@ -22,6 +25,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
+import calendar
 
 # 添加 toolkit 路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "climate_analysis_toolkit"))
@@ -33,11 +37,12 @@ from common_config import (
     MODEL_LIST,
     LEADTIMES,
     SEASONS,
+    COLORS,
 )
 
 # 配置日志
 logger = setup_logging(
-    log_file='taylor_plot_v4.log',
+    log_file='taylor_plot_v5.log',
     module_name=__name__
 )
 
@@ -58,6 +63,15 @@ def generate_regions():
     return regions
 
 REGIONS = generate_regions()
+
+# 定义绘图用的季节 Marker
+SEASON_MARKERS = {
+    'Annual': '*',
+    'DJF': 'o',
+    'MAM': '^',
+    'JJA': 's',
+    'SON': 'D'
+}
 
 # =============================================================================
 # 内置 TaylorDiagram 实现 (保持不变)
@@ -110,17 +124,17 @@ class TaylorDiagram(object):
         ax.axis["top"].label.set_axis_direction("top")
         ax.axis["top"].label.set_text("Correlation")
         ax.axis["top"].label.set_fontsize(16)
-        ax.axis["top"].major_ticklabels.set_fontsize(14)
+        ax.axis["top"].major_ticklabels.set_fontsize(16)
 
         ax.axis["left"].set_axis_direction("bottom")
         ax.axis["left"].label.set_text("Standard deviation (Normalized)")
         ax.axis["left"].label.set_fontsize(16)
-        ax.axis["left"].major_ticklabels.set_fontsize(14)
+        ax.axis["left"].major_ticklabels.set_fontsize(16)
 
         ax.axis["right"].set_axis_direction("top")
         ax.axis["right"].toggle(ticklabels=True)
         ax.axis["right"].major_ticklabels.set_axis_direction("left")
-        ax.axis["right"].major_ticklabels.set_fontsize(14)
+        ax.axis["right"].major_ticklabels.set_fontsize(16)
 
         ax.axis["bottom"].set_visible(False)
 
@@ -225,7 +239,6 @@ class TaylorAnalyzer:
             p.mkdir(parents=True, exist_ok=True)
 
     def load_and_preprocess(self, model: str, leadtime: int):
-        # 保持原有数据加载逻辑不变
         try:
             obs_data = self.data_loader.load_obs_data(self.var_type)
             obs_data = obs_data.resample(time='1MS').mean()
@@ -233,75 +246,91 @@ class TaylorAnalyzer:
 
             fcst_data = self.data_loader.load_forecast_data_ensemble(model, self.var_type, leadtime)
             if fcst_data is None: return None, None
-            
+
             if 'number' in fcst_data.dims:
                 fcst_data = fcst_data.mean(dim='number')
-                
+
             fcst_data = fcst_data.resample(time='1MS').mean()
             fcst_data = fcst_data.sel(time=slice('1993', '2020'))
-            
+
             common_times = obs_data.time.to_index().intersection(fcst_data.time.to_index())
             if len(common_times) < 12: return None, None
-            
+
             obs_aligned = obs_data.sel(time=common_times)
             fcst_aligned = fcst_data.sel(time=common_times)
-            
+
             fcst_interp = fcst_aligned.interp(lat=obs_aligned.lat, lon=obs_aligned.lon, method='linear')
-            
+
             obs_clim = obs_aligned.groupby('time.month').mean('time')
             obs_anom = obs_aligned.groupby('time.month') - obs_clim
-            
+
             fcst_clim = fcst_interp.groupby('time.month').mean('time')
             fcst_anom = fcst_interp.groupby('time.month') - fcst_clim
-            
+
             return obs_anom, fcst_anom
         except Exception as e:
             logger.error(f"Data loading failed {model} L{leadtime}: {e}")
             return None, None
 
-    def compute_metrics_task(self, model, leadtime, seasons):
-        # 保持原有计算任务逻辑不变
+    def _calc_metrics_for_mask(self, obs, fcst, mask):
+        """对指定时间 mask 计算所有区域的指标"""
+        if isinstance(mask, slice):
+            o_sub = obs
+            f_sub = fcst
+        else:
+            o_sub = obs.sel(time=mask)
+            f_sub = fcst.sel(time=mask)
+
+        if o_sub.size == 0: return None
+
+        reg_res = {}
+        for reg_name, reg_bounds in REGIONS.items():
+            reg_res[reg_name] = calculate_weighted_metrics(o_sub, f_sub, reg_bounds)
+        return reg_res
+
+    def compute_metrics_task(self, model, leadtime):
+        """计算 Annual, Seasons(DJF..), Months(Jan..) 的指标"""
         obs_anom, fcst_anom = self.load_and_preprocess(model, leadtime)
         if obs_anom is None: return None
-        
-        results = {} 
-        season_list = ['annual'] + list(seasons) if seasons else ['annual']
-        
-        for season in season_list:
-            results[season] = {}
-            if season == 'annual':
-                obs_season = obs_anom
-                fcst_season = fcst_anom
-            elif season in SEASONS:
-                months = SEASONS[season]
-                mask = obs_anom.time.dt.month.isin(months)
-                obs_season = obs_anom.sel(time=mask)
-                fcst_season = fcst_anom.sel(time=mask)
-            else:
-                continue
-            
-            if obs_season.size == 0: continue
 
-            for reg_name, reg_bounds in REGIONS.items():
-                metrics = calculate_weighted_metrics(obs_season, fcst_season, reg_bounds)
-                results[season][reg_name] = metrics
-                
+        results = {}
+
+        # 1. Annual
+        met_annual = self._calc_metrics_for_mask(obs_anom, fcst_anom, slice(None))
+        if met_annual: results['Annual'] = met_annual
+
+        # 2. Seasons (DJF, MAM, JJA, SON)
+        for season_name, months in SEASONS.items():
+            mask = obs_anom.time.dt.month.isin(months)
+            met_season = self._calc_metrics_for_mask(obs_anom, fcst_anom, mask)
+            if met_season: results[season_name] = met_season
+
+        # 3. Monthly (Jan..Dec)
+        for m in range(1, 13):
+            mask = obs_anom.time.dt.month == m
+            m_name = calendar.month_abbr[m]
+            met_month = self._calc_metrics_for_mask(obs_anom, fcst_anom, mask)
+            if met_month: results[m_name] = met_month
+
         return (model, leadtime, results)
 
-    def run_analysis(self, models, leadtimes, seasons, parallel=True, plot_only=False, no_plot=False):
+    def run_analysis(self, models, leadtimes, parallel=True, plot_only=False, no_plot=False):
         if plot_only:
-            final_data, models_loaded, leadtimes_loaded = self.load_metrics(seasons)
-            if not final_data:
+            ds = self.load_metrics()
+            if ds is None:
                 logger.warning("Plot-only: no saved metrics found, skip plotting.")
                 return
-            logger.info(f"Plot-only: loaded metrics for {self.var_type}, seasons={list(final_data.keys())}")
-            self.plot_all(final_data, leadtimes_loaded, models_loaded)
+            logger.info(f"Plot-only: loaded metrics for {self.var_type}")
+            leadtimes_plot = [int(x) for x in ds.leadtime.values]
+            models_plot = [str(x) for x in ds.model.values]
+            self.plot_all(ds, leadtimes_plot, models_plot)
+            ds.close()
             return
 
-        tasks = [(m, lt, seasons) for lt in leadtimes for m in models]
+        tasks = [(m, lt) for lt in leadtimes for m in models]
         final_data = {}
 
-        logger.info(f"Start Taylor analysis for {self.var_type}...")
+        logger.info(f"Start Taylor analysis for {self.var_type} (Annual + Seasons + Months)...")
 
         if parallel:
             max_workers = min(self.n_jobs or cpu_count(), 32)
@@ -310,7 +339,7 @@ class TaylorAnalyzer:
                 for i, future in enumerate(as_completed(futures)):
                     res = future.result()
                     if res: self._organize_results(final_data, res)
-                    if (i+1) % 10 == 0: logger.info(f"Progress: {i+1}/{len(tasks)}")
+                    if (i + 1) % 10 == 0: logger.info(f"Progress: {i+1}/{len(tasks)}")
         else:
             for t in tasks:
                 res = self.compute_metrics_task(*t)
@@ -322,237 +351,190 @@ class TaylorAnalyzer:
             self.plot_all(final_data, leadtimes, models)
 
     def _organize_results(self, final_data, res):
-        model, leadtime, season_results = res
-        for season, reg_dict in season_results.items():
-            if season not in final_data: final_data[season] = {}
-            # 注意结构：final_data[season][leadtime][reg][model]
-            if leadtime not in final_data[season]: final_data[season][leadtime] = {}
-            
-            for reg, metrics in reg_dict.items():
-                if reg not in final_data[season][leadtime]: 
-                    final_data[season][leadtime][reg] = {}
-                final_data[season][leadtime][reg][model] = metrics
+        model, leadtime, period_results = res
+        if leadtime not in final_data: final_data[leadtime] = {}
+        if model not in final_data[leadtime]: final_data[leadtime][model] = {}
+        for period, reg_dict in period_results.items():
+            final_data[leadtime][model][period] = reg_dict
 
     def save_metrics(self, data):
-        for season, lt_dict in data.items():
-            rows = []
-            for lt, reg_dict in lt_dict.items():
-                for reg, mod_dict in reg_dict.items():
-                    for mod, met in mod_dict.items():
+        """保存所有计算结果到一个 NetCDF 文件"""
+        rows = []
+        for lt, mod_dict in data.items():
+            for mod, period_dict in mod_dict.items():
+                for period, reg_dict in period_dict.items():
+                    for reg, met in reg_dict.items():
                         rows.append({
                             'leadtime': lt,
-                            'region': reg,
                             'model': mod,
+                            'season': period,
+                            'region': reg,
                             'corr': met['corr'],
                             'std_ratio': met['std_ratio'],
                             'crmse': met['crmse']
                         })
-            if not rows: continue
-            df = pd.DataFrame(rows)
-            ds = df.set_index(['leadtime', 'region', 'model']).to_xarray()
-            out_file = self.data_dir / f"metrics_taylor_{self.var_type}_{season}.nc"
-            ds.to_netcdf(out_file)
-            logger.info(f"Saved metrics: {out_file}")
+        if not rows: return
 
-    def load_metrics(self, seasons):
-        """从已保存的 NetCDF 加载指标，用于 --plot-only。返回 final_data, models, leadtimes。"""
-        final_data = {}
-        all_models = set()
-        all_leadtimes = set()
-        # 计算时总会保存 annual，故 plot-only 时也尝试加载 annual
-        seasons_to_load = (['annual'] + list(seasons)) if 'annual' not in seasons else list(seasons)
-        for season in seasons_to_load:
-            out_file = self.data_dir / f"metrics_taylor_{self.var_type}_{season}.nc"
-            if not out_file.exists():
-                logger.warning(f"Plot-only: file not found, skip season {season}: {out_file}")
-                continue
-            ds = xr.open_dataset(out_file)
-            final_data[season] = {}
-            for lt in ds.coords['leadtime'].values:
-                lt_int = int(lt)
-                all_leadtimes.add(lt_int)
-                final_data[season][lt_int] = {}
-                for reg in ds.coords['region'].values:
-                    reg_str = str(reg) if not isinstance(reg, str) else reg
-                    final_data[season][lt_int][reg_str] = {}
-                    for mod in ds.coords['model'].values:
-                        mod_str = str(mod) if not isinstance(mod, str) else mod
-                        all_models.add(mod_str)
-                        final_data[season][lt_int][reg_str][mod_str] = {
-                            'corr': float(ds['corr'].sel(leadtime=lt, region=reg, model=mod).values),
-                            'std_ratio': float(ds['std_ratio'].sel(leadtime=lt, region=reg, model=mod).values),
-                            'crmse': float(ds['crmse'].sel(leadtime=lt, region=reg, model=mod).values)
-                        }
-            ds.close()
-        models = sorted(all_models)
-        leadtimes = sorted(all_leadtimes)
-        return final_data, models, leadtimes
+        df = pd.DataFrame(rows)
+        ds = df.set_index(['leadtime', 'model', 'season', 'region']).to_xarray()
+        out_file = self.data_dir / f"metrics_taylor_{self.var_type}_all.nc"
+        ds.to_netcdf(out_file)
+        logger.info(f"Saved all metrics to: {out_file}")
+
+    def load_metrics(self):
+        """加载已保存的指标数据（单文件）"""
+        out_file = self.data_dir / f"metrics_taylor_{self.var_type}_all.nc"
+        if not out_file.exists():
+            return None
+        return xr.open_dataset(out_file)
 
     # =========================================================================
-    # 新的绘图逻辑部分
+    # 绘图逻辑：按 Lead Time 分图，颜色=Model，点型=Season
     # =========================================================================
     def plot_all(self, data, leadtimes, models):
-        """
-        data: final_data[season][leadtime][reg][model]
-        """
-        # 准备样式
-        # 1. Models 用颜色区分
-        cmap = plt.cm.get_cmap('tab10')
-        colors = [cmap(i) for i in np.linspace(0, 1, 10)]
-        model_colors = {m: colors[i % len(colors)] for i, m in enumerate(models)}
-        
-        # 2. Leadtimes 用点型区分
-        # 常用点型: 圆圈, 正方形, 三角形, 钻石, 倒三角, 左三角, 右三角, 五边形, 星形, X
-        markers_list = ['o', 's', '^', 'D', 'v', '<', '>', 'P', '*', 'X']
-        # 对 leadtimes 进行排序以保证图例顺序一致
-        sorted_lts = sorted(leadtimes)
-        lt_markers = {lt: markers_list[i % len(markers_list)] for i, lt in enumerate(sorted_lts)}
+        """data: xarray Dataset 或 dict [leadtime][model][season][region]"""
+        if isinstance(data, dict):
+            rows = []
+            for lt, mod_dict in data.items():
+                for mod, period_dict in mod_dict.items():
+                    for period, reg_dict in period_dict.items():
+                        for reg, met in reg_dict.items():
+                            rows.append({
+                                'leadtime': lt, 'model': mod, 'season': period, 'region': reg,
+                                'corr': met['corr'], 'std_ratio': met['std_ratio'], 'crmse': met['crmse']
+                            })
+            df = pd.DataFrame(rows)
+            ds = df.set_index(['leadtime', 'model', 'season', 'region']).to_xarray()
+        else:
+            ds = data
 
-        for season, lt_data in data.items():
-            # 这里我们需要重组数据以便于绘图：按 [Region] -> [Leadtime] -> [Model] 访问
-            # 但原始结构是 [Leadtime][Region][Model]
-            # 为了方便，我们在绘图函数内部遍历
-            
-            # 1. 绘制 Global 单张图
-            self.plot_global_only(season, data[season], model_colors, lt_markers)
-            
-            # 2. 绘制 Regions 九宫格
-            self.plot_regions_grid(season, data[season], model_colors, lt_markers)
+        if len(models) <= 10:
+            color_list = COLORS if len(COLORS) >= len(models) else plt.cm.tab10.colors
+        else:
+            color_list = plt.cm.tab20.colors
+        model_colors = {m: color_list[i % len(color_list)] for i, m in enumerate(models)}
 
-    def _create_common_legend(self, fig, model_colors, lt_markers):
-        """创建组合图例：分两列，一列Models，一列Leadtimes"""
+        plot_seasons = ['Annual', 'DJF', 'MAM', 'JJA', 'SON']
+        available_lts = [int(x) for x in ds.leadtime.values]
+
+        for lt in leadtimes:
+            if lt not in available_lts: continue
+            try:
+                ds_lt = ds.sel(leadtime=lt)
+            except Exception:
+                continue
+            self.plot_single_leadtime_global(lt, ds_lt, models, plot_seasons, model_colors)
+            self.plot_single_leadtime_regions(lt, ds_lt, models, plot_seasons, model_colors)
+
+    def _create_legend(self, fig, model_colors, season_markers):
+        """创建组合图例：Color=Model, Marker=Season"""
         handles = []
         labels = []
-        
-        # Model Legend (Color only, invisible marker or simple dot)
-        handles.append(Line2D([0], [0], color='w', label='[ Models ]', marker=None)) # Title
+        handles.append(Line2D([0], [0], color='w', label='[ Models ]', marker=None))
         labels.append(r"$\bf{Models}$")
-        
         for m_name, color in model_colors.items():
             display_name = m_name.replace('-mon', '').replace('mon-', '').replace('Meteo-France', 'MF').replace('ECCC-Canada', 'ECCC')
             h = Line2D([0], [0], color=color, marker='o', linestyle='', markersize=8)
             handles.append(h)
             labels.append(display_name)
-            
-        # Spacer
         handles.append(Line2D([0], [0], color='w', label=' ', marker=None))
         labels.append(" ")
-        
-        # Leadtime Legend (Black color, varies marker)
-        handles.append(Line2D([0], [0], color='w', label='[ Lead Times ]', marker=None))
-        labels.append(r"$\bf{Lead\ Times}$")
-        
-        for lt, marker in lt_markers.items():
+        handles.append(Line2D([0], [0], color='w', label='[ Seasons ]', marker=None))
+        labels.append(r"$\bf{Seasons}$")
+        for s_name in ['Annual', 'DJF', 'MAM', 'JJA', 'SON']:
+            marker = SEASON_MARKERS.get(s_name, 'o')
             h = Line2D([0], [0], color='k', marker=marker, linestyle='', markersize=8)
             handles.append(h)
-            labels.append(f"Lead {lt}")
-
-        # 将图例放在底部，自动换行
-        # 为了美观，可以分两个Legend，或者计算好列数
-        # 这里使用简单的一行多列流式布局
-        fig.legend(handles, labels, loc='lower center', ncol=min(6, len(handles)), 
+            labels.append(s_name)
+        fig.legend(handles, labels, loc='lower center', ncol=min(6, len(handles)),
                    bbox_to_anchor=(0.5, 0.02), fontsize=16, frameon=True)
 
-    def plot_global_only(self, season, season_data, model_colors, lt_markers):
-        """单独绘制 Global 区域"""
+    def plot_single_leadtime_global(self, leadtime, ds_data, models, seasons, model_colors):
+        """绘制单个 Leadtime 的 Global 图"""
         reg_name = 'Global'
-        
         fig = plt.figure(figsize=(10, 10))
-        # 留出底部给图例
-        rect = [0.1, 0.2, 0.8, 0.7] 
-        
+        rect = [0.1, 0.2, 0.8, 0.7]
         td = TaylorDiagram(refstd=1.0, fig=fig, rect=rect, label='Obs', srange=(0, 1.6))
         td.add_contours(levels=5, colors='gray', alpha=0.4)
-        
         plotted_any = False
-        
-        # season_data 结构: {leadtime: {region: {model: metrics}}}
-        for lt, reg_dict in season_data.items():
-            if reg_name not in reg_dict: continue
-            
-            marker = lt_markers.get(lt, 'o')
-            metrics_dict = reg_dict[reg_name]
-            
-            for model, met in metrics_dict.items():
-                color = model_colors.get(model, 'k')
-                
-                if np.isfinite(met['corr']) and np.isfinite(met['std_ratio']):
-                    td.add_sample(met['std_ratio'], met['corr'], 
-                                  color=color, marker=marker, markersize=12, 
-                                  label="_nolegend_") # 图例单独画
-                    plotted_any = True
+
+        for model in models:
+            if model not in ds_data.model.values: continue
+            color = model_colors.get(model, 'k')
+            for season in seasons:
+                if season not in ds_data.season.values: continue
+                try:
+                    corr = float(ds_data['corr'].sel(region=reg_name, model=model, season=season).values)
+                    std_ratio = float(ds_data['std_ratio'].sel(region=reg_name, model=model, season=season).values)
+                    if np.isfinite(corr) and np.isfinite(std_ratio):
+                        marker = SEASON_MARKERS.get(season, 'o')
+                        td.add_sample(std_ratio, corr, color=color, marker=marker, markersize=12, label="_nolegend_")
+                        plotted_any = True
+                except (KeyError, TypeError):
+                    continue
 
         if not plotted_any:
             plt.close(fig)
             return
-
-        td._ax.set_title(f"Global - {self.var_type.upper()} ({season})", fontsize=22, fontweight='bold', y=1.08)
         
-        self._create_common_legend(fig, model_colors, lt_markers)
-        
-        out_file = self.plot_dir / f"taylor_Global_{self.var_type}_{season}_multilead.png"
+        # 不需要图片标题
+        # td._ax.set_title(f"Global - {self.var_type.upper()} (Lead Time {leadtime})", fontsize=20, fontweight='bold', y=1.08)
+        self._create_legend(fig, model_colors, SEASON_MARKERS)
+        out_file = self.plot_dir / f"taylor_Global_{self.var_type}_L{leadtime}.png"
         plt.savefig(out_file, dpi=300, bbox_inches='tight')
         plt.close(fig)
         logger.info(f"Global plot saved: {out_file}")
 
-    def plot_regions_grid(self, season, season_data, model_colors, lt_markers):
-        """绘制除 Global 外的区域 (九宫格)"""
+    def plot_single_leadtime_regions(self, leadtime, ds_data, models, seasons, model_colors):
+        """绘制单个 Leadtime 的 Regions 九宫格"""
         regions_ordered = [
             'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
-            'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
-            'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+            'Z4-Tibetan', 'Z5-NorthChina', 'Z6-Yangtze',
+            'Z7-Southwest', 'Z8-SouthChina', 'Z9-SouthSea'
         ]
-        
         fig = plt.figure(figsize=(20, 19))
-        # 调整底部空间以容纳更大的图例
         gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3, top=0.92, bottom=0.15)
-        
         plotted_any = False
-        
+
         for i, reg_name in enumerate(regions_ordered):
-            # 获取 subplot 位置
             ax_spec = gs[i // 3, i % 3]
             bbox = ax_spec.get_position(fig)
             rect = [bbox.x0, bbox.y0, bbox.width, bbox.height]
-            
             td = TaylorDiagram(refstd=1.0, fig=fig, rect=rect, label='Obs', srange=(0, 1.6))
             td.add_contours(levels=5, colors='gray', alpha=0.4)
             td._ax.set_title(f"{reg_name}", fontsize=18, fontweight='bold', y=1.05)
-            
-            # 遍历所有 Leadtime 和 Model
-            for lt, reg_dict in season_data.items():
-                if reg_name not in reg_dict: continue
-                
-                marker = lt_markers.get(lt, 'o')
-                metrics_dict = reg_dict[reg_name]
-                
-                for model, met in metrics_dict.items():
-                    color = model_colors.get(model, 'k')
-                    
-                    if np.isfinite(met['corr']) and np.isfinite(met['std_ratio']):
-                        td.add_sample(met['std_ratio'], met['corr'], 
-                                      color=color, marker=marker, markersize=10, 
-                                      label="_nolegend_")
-                        plotted_any = True
-        
+
+            for model in models:
+                if model not in ds_data.model.values: continue
+                color = model_colors.get(model, 'k')
+                for season in seasons:
+                    if season not in ds_data.season.values: continue
+                    try:
+                        corr = float(ds_data['corr'].sel(region=reg_name, model=model, season=season).values)
+                        std_ratio = float(ds_data['std_ratio'].sel(region=reg_name, model=model, season=season).values)
+                        if np.isfinite(corr) and np.isfinite(std_ratio):
+                            marker = SEASON_MARKERS.get(season, 'o')
+                            td.add_sample(std_ratio, corr, color=color, marker=marker, markersize=10, label="_nolegend_")
+                            plotted_any = True
+                    except (KeyError, TypeError):
+                        continue
+
         if not plotted_any:
             plt.close(fig)
             return
-
-        # fig.suptitle(f"Regional Performance ({self.var_type.upper()}) - {season}", 
-        #              fontsize=24, fontweight='bold', y=0.96)
         
-        self._create_common_legend(fig, model_colors, lt_markers)
-        
-        out_file = self.plot_dir / f"taylor_Regions_{self.var_type}_{season}_multilead.png"
+        # 不需要图片标题
+        # fig.suptitle(f"Regional Performance - {self.var_type.upper()} (Lead Time {leadtime})", fontsize=24, fontweight='bold', y=0.96)
+        self._create_legend(fig, model_colors, SEASON_MARKERS)
+        out_file = self.plot_dir / f"taylor_Regions_{self.var_type}_L{leadtime}.png"
         plt.savefig(out_file, dpi=300, bbox_inches='tight')
         plt.close(fig)
         logger.info(f"Regions plot saved: {out_file}")
 
 def main():
     parser = create_parser(
-        description="Taylor图分析（空间-时间型）",
-        include_seasons=True,
+        description="Taylor图分析（按 Lead Time 分图，点型=季节）",
+        include_seasons=False,
         var_default=None,
         var_required=False
     )
@@ -562,17 +544,6 @@ def main():
     leadtimes = parse_leadtimes(args.leadtimes, LEADTIMES) if args.leadtimes else LEADTIMES
     var_list = parse_vars(args.var) if args.var else ['temp', 'prec']
 
-    seasons = []
-    if getattr(args, 'all_seasons', False):
-        seasons = list(SEASONS.keys())
-    elif getattr(args, 'seasons', None):
-        if 'all' in args.seasons:
-            seasons = list(SEASONS.keys())
-        else:
-            seasons = [s for s in args.seasons if s in SEASONS]
-    if not seasons:
-        seasons = list(SEASONS.keys())
-
     parallel = normalize_parallel_args(args) or (args.n_jobs is not None and args.n_jobs > 1)
 
     for var in var_list:
@@ -580,7 +551,6 @@ def main():
         analyzer.run_analysis(
             models=models,
             leadtimes=leadtimes,
-            seasons=seasons,
             parallel=parallel,
             plot_only=args.plot_only,
             no_plot=args.no_plot
