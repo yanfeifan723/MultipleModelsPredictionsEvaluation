@@ -109,15 +109,18 @@ class TaylorDiagram(object):
         ax.axis["top"].major_ticklabels.set_axis_direction("top")
         ax.axis["top"].label.set_axis_direction("top")
         ax.axis["top"].label.set_text("Correlation")
-        ax.axis["top"].label.set_fontsize(12)
+        ax.axis["top"].label.set_fontsize(16)
+        ax.axis["top"].major_ticklabels.set_fontsize(14)
 
         ax.axis["left"].set_axis_direction("bottom")
         ax.axis["left"].label.set_text("Standard deviation (Normalized)")
-        ax.axis["left"].label.set_fontsize(12)
+        ax.axis["left"].label.set_fontsize(16)
+        ax.axis["left"].major_ticklabels.set_fontsize(14)
 
         ax.axis["right"].set_axis_direction("top")
         ax.axis["right"].toggle(ticklabels=True)
         ax.axis["right"].major_ticklabels.set_axis_direction("left")
+        ax.axis["right"].major_ticklabels.set_fontsize(14)
 
         ax.axis["bottom"].set_visible(False)
 
@@ -356,7 +359,9 @@ class TaylorAnalyzer:
         final_data = {}
         all_models = set()
         all_leadtimes = set()
-        for season in seasons:
+        # 计算时总会保存 annual，故 plot-only 时也尝试加载 annual
+        seasons_to_load = (['annual'] + list(seasons)) if 'annual' not in seasons else list(seasons)
+        for season in seasons_to_load:
             out_file = self.data_dir / f"metrics_taylor_{self.var_type}_{season}.nc"
             if not out_file.exists():
                 logger.warning(f"Plot-only: file not found, skip season {season}: {out_file}")
@@ -446,7 +451,7 @@ class TaylorAnalyzer:
         # 为了美观，可以分两个Legend，或者计算好列数
         # 这里使用简单的一行多列流式布局
         fig.legend(handles, labels, loc='lower center', ncol=min(6, len(handles)), 
-                   bbox_to_anchor=(0.5, 0.02), fontsize=12, frameon=True)
+                   bbox_to_anchor=(0.5, 0.02), fontsize=16, frameon=True)
 
     def plot_global_only(self, season, season_data, model_colors, lt_markers):
         """单独绘制 Global 区域"""
@@ -481,7 +486,7 @@ class TaylorAnalyzer:
             plt.close(fig)
             return
 
-        # td._ax.set_title(f"Global - {self.var_type.upper()} ({season})", fontsize=18, fontweight='bold', y=1.08)
+        td._ax.set_title(f"Global - {self.var_type.upper()} ({season})", fontsize=22, fontweight='bold', y=1.08)
         
         self._create_common_legend(fig, model_colors, lt_markers)
         
@@ -498,7 +503,7 @@ class TaylorAnalyzer:
             'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
         ]
         
-        fig = plt.figure(figsize=(20, 23))
+        fig = plt.figure(figsize=(20, 19))
         # 调整底部空间以容纳更大的图例
         gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3, top=0.92, bottom=0.15)
         
@@ -512,7 +517,7 @@ class TaylorAnalyzer:
             
             td = TaylorDiagram(refstd=1.0, fig=fig, rect=rect, label='Obs', srange=(0, 1.6))
             td.add_contours(levels=5, colors='gray', alpha=0.4)
-            td._ax.set_title(f"{reg_name}", fontsize=14, fontweight='bold', y=1.05)
+            td._ax.set_title(f"{reg_name}", fontsize=18, fontweight='bold', y=1.05)
             
             # 遍历所有 Leadtime 和 Model
             for lt, reg_dict in season_data.items():
