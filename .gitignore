@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.manifest
+.installed.cfg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+.env/
+
+# IDE / 编辑器
+.cursor/
+.vscode/
+*.swp
+*.swo
+*~
+.idea/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# 日志与运行时
+log/
+*.log
+*.lock
+
+# 输出与结果
+output/
+outputdata/
+outputplot/
+
+# 备份与旧文件
+backup_*/
+old/
+*_backup/
+*.backup.py
+
+# 大型数据（NetCDF 等，按需取消注释）
+*.nc
+ERA5/
+CN05.1/
+CMFD/
+obs/
+MonthlyPressureLevel/
+boundaries/
+
+# 临时与缓存
+*.tmp
+*.temp
+.cache/
+
+# 工具类
+*.sh
