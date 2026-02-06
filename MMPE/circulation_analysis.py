@@ -1107,6 +1107,13 @@ class CirculationAnalyzer:
             
             logger.info(f"保存 {source} 中国区域温度/降水异常...")
             
+            # 移除可能导致冲突的辅助坐标（如 month）
+            # groupby('time.month') 会引入 month 坐标，合并时可能引发冲突
+            if 'month' in temp_anom.coords:
+                temp_anom = temp_anom.drop_vars('month')
+            if 'month' in prec_anom.coords:
+                prec_anom = prec_anom.drop_vars('month')
+            
             # 创建 Dataset
             ds = xr.Dataset({
                 'temp_anom': temp_anom,
@@ -3144,9 +3151,7 @@ def main():
     # 添加环流分析特有的参数
     parser.add_argument('--no-save-obs', action='store_true',
                        help='不保存观测气候态到NetCDF文件（默认总是保存）')
-    
-    # 添加 Nino3.4 相关参数
-    
+
     parser.add_argument('--era5-single-level-root', type=str,
                        default='/sas12t1/ffyan/ERA5/daily-nc/single-level/',
                        help='ERA5 single-level 数据根目录（默认: /sas12t1/ffyan/ERA5/daily-nc/single-level/）')
