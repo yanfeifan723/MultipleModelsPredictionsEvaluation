@@ -119,16 +119,7 @@ class IndexAnalyzer:
     def load_obs_pressure_level_data(self, var_name: str, pressure_level: int = 500,
                                      year_range: Tuple[int, int] = (1993, 2020)) -> Optional[xr.DataArray]:
         """
-        从MonthlyPressureLevel目录加载ERA5观测气压层数据
-        参考 circulation_analysis.py 中的实现
-        
-        Args:
-            var_name: 变量名（u, v, q, z）
-            pressure_level: 气压层（hPa），默认500
-            year_range: 年份范围，默认(1993, 2020)
-        
-        Returns:
-            观测数据 (time, lat, lon) 或 None
+        从MonthlyPressureLevel加载观测数据 (修复纬度排序问题，避免 slice 切出空导致 NaN)
         """
         try:
             obs_dir = Path("/sas12t1/ffyan/MonthlyPressureLevel")
@@ -147,12 +138,10 @@ class IndexAnalyzer:
                     file_path = obs_dir / f"era5_pressure_levels_{year}{month:02d}.nc"
                     
                     if not file_path.exists():
-                        logger.debug(f"文件不存在: {file_path}")
                         continue
                     
                     try:
                         with xr.open_dataset(file_path) as ds:
-                            # 查找变量（支持大小写变体）
                             var_candidates = [var_name, var_name.upper(), var_name.lower()]
                             actual_var = None
                             for candidate in var_candidates:
@@ -161,49 +150,33 @@ class IndexAnalyzer:
                                     break
                             
                             if actual_var is None:
-                                logger.debug(f"变量 {var_name} 不在文件 {file_path.name} 中")
                                 continue
                             
                             da = ds[actual_var]
                             
-                            # 检查维度
-                            if 'pressure_level' not in da.dims and 'level' not in da.dims:
-                                logger.warning(f"变量 {var_name} 没有气压层维度，跳过: {file_path.name}")
-                                continue
-                            
-                            # 选择气压层
                             level_coord = 'pressure_level' if 'pressure_level' in da.dims else 'level'
-                            level_values = ds[level_coord].values
+                            if level_coord in da.coords:
+                                if pressure_level in ds[level_coord].values:
+                                    da = da.sel({level_coord: pressure_level}).drop_vars(level_coord, errors='ignore')
+                                else:
+                                    continue
                             
-                            if pressure_level not in level_values:
-                                logger.warning(f"气压层 {pressure_level} hPa 不在数据中，可用层: {level_values}")
-                                continue
+                            time_coord = 'valid_time' if 'valid_time' in da.dims else ('time' if 'time' in da.dims else None)
+                            if time_coord and da[time_coord].size > 0:
+                                da = da.isel({time_coord: 0})
                             
-                            da = da.sel({level_coord: pressure_level}).drop_vars(level_coord, errors='ignore')
-                            
-                            # 处理时间维度（ERA5文件有valid_time维度）
-                            time_coord = None
-                            if 'valid_time' in da.dims:
-                                time_coord = 'valid_time'
-                            elif 'time' in da.dims:
-                                time_coord = 'time'
-                            
-                            if time_coord:
-                                # 取第一个时间点（月平均值）
-                                if da[time_coord].size > 0:
-                                    da = da.isel({time_coord: 0})
-                            
-                            # 重命名坐标为标准名称
                             if 'latitude' in da.coords:
                                 da = da.rename({'latitude': 'lat'})
                             if 'longitude' in da.coords:
                                 da = da.rename({'longitude': 'lon'})
                             
-                            # 添加时间坐标
+                            # 关键：确保纬度升序，否则 slice(25, 35) 在降序 lat 上返回空
+                            if 'lat' in da.coords and da.lat.values[0] > da.lat.values[-1]:
+                                da = da.sortby('lat')
+                            
                             time_stamp = pd.Timestamp(year, month, 1)
                             da = da.expand_dims(time=[time_stamp])
                             
-                            # 加载数据到内存（确保文件关闭后数据仍然可用）
                             monthly_da_list.append(da.load())
                         
                     except Exception as e:
@@ -211,21 +184,18 @@ class IndexAnalyzer:
                         continue
             
             if not monthly_da_list:
-                logger.warning(f"未找到观测数据: {var_name} @ {pressure_level}hPa")
                 return None
             
-            # 拼接所有月份数据
             data = xr.concat(monthly_da_list, dim='time')
             data = data.sortby('time')
-            data = data.load()
+            if 'lat' in data.coords and data.lat.values[0] > data.lat.values[-1]:
+                data = data.sortby('lat')
             
             logger.info(f"观测数据加载完成: {var_name} @ {pressure_level}hPa, shape={data.shape}")
             return data
             
         except Exception as e:
             logger.error(f"加载观测气压层数据失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             return None
 
     def load_era5_sst_daily(self, year_range: Tuple[int, int] = (1993, 2020),
@@ -342,112 +312,99 @@ class IndexAnalyzer:
     def load_model_sst_monthly(self, model: str, leadtime: int,
                                 year_range: Tuple[int, int] = (1993, 2020)) -> Optional[xr.DataArray]:
         """
-        加载模式SST月平均数据
-        参考 circulation_analysis.py 和 notebook 中的实现
-        
-        Args:
-            model: 模式名称
-            leadtime: 提前期
-            year_range: 年份范围
-        
-        Returns:
-            SST月平均数据 (time, number, lat, lon) 或 (time, lat, lon)
+        【内存优化版】加载模式SST并直接计算区域平均
+        直接返回 Nino3.4 区域的平均值，而不是全球网格点，以避免 NCEP-2 (124 members) 爆内存
         """
         try:
             forecast_dir = Path("/raid62/EC-C3S/month")
             model_dir = forecast_dir / model
             
             if not model_dir.exists():
-                logger.warning(f"模型目录不存在: {model_dir}")
-                return None
-            
-            # 获取文件后缀（SST通常在sfc文件中）
-            if model not in self.data_loader.models:
-                logger.error(f"不支持的模型: {model}")
                 return None
             
             suffix = self.data_loader.models[model].get('sfc', None)
             if suffix is None:
-                logger.error(f"模型 {model} 没有sfc文件配置")
                 return None
             
-            logger.info(f"加载模式 SST 数据: {model} L{leadtime}")
+            logger.info(f"加载模式 SST 数据 (优化模式): {model} L{leadtime}")
             
-            monthly_da_list = []
+            monthly_values_list = []
             start_year, end_year = year_range
             
             for year in range(start_year, end_year + 1):
                 for month in range(1, 13):
                     file_path = model_dir / f"{year}{month:02d}.{suffix}.nc"
-                    
                     if not file_path.exists():
-                        logger.debug(f"文件不存在: {file_path}")
                         continue
                     
                     try:
                         with xr.open_dataset(file_path) as ds:
-                            # 查找SST变量（可能的名称）
                             sst_vars = ['sst', 'tos', 'sea_surface_temperature', 'SST', 'TOS']
                             actual_var = None
                             for candidate in sst_vars:
                                 if candidate in ds:
                                     actual_var = candidate
                                     break
-                            
                             if actual_var is None:
-                                logger.debug(f"SST变量不在文件 {file_path.name} 中")
                                 continue
                             
                             da = ds[actual_var]
                             
-                            # 选择 leadtime
+                            # 时间选择
                             if 'time' in da.dims and da.time.size > leadtime:
                                 da = da.isel(time=leadtime)
                             elif 'time' in da.dims:
-                                # 尝试按时间选择
                                 init_time = pd.Timestamp(year, month, 1)
                                 try:
                                     da = da.sel(time=init_time, method='nearest', tolerance='15D')
-                                except:
-                                    logger.debug(f"无法选择 leadtime {leadtime} 的数据")
+                                except Exception:
                                     continue
                             
-                            # 确保有 number 维度（如果没有则创建）
-                            if 'number' not in da.dims:
-                                da = da.expand_dims('number')
-                            
-                            # 标准化坐标名
-                            if 'latitude' in da.coords and 'lat' not in da.coords:
+                            # 坐标标准化
+                            if 'latitude' in da.coords:
                                 da = da.rename({'latitude': 'lat'})
-                            if 'longitude' in da.coords and 'lon' not in da.coords:
+                            if 'longitude' in da.coords:
                                 da = da.rename({'longitude': 'lon'})
                             
-                            # 创建时间坐标
-                            forecast_time = pd.Timestamp(year, month, 1) + pd.DateOffset(months=leadtime)
-                            da = da.expand_dims(time=[forecast_time])
+                            # 关键修复：处理经度 (0-360)
+                            if da.lon.min() < 0:
+                                da.coords['lon'] = (da.coords['lon'] + 360) % 360
+                                da = da.sortby('lon')
                             
-                            # 加载数据到内存（文件关闭后数据仍然可用）
-                            monthly_da_list.append(da.load())
-                        
-                    except Exception as e:
-                        logger.debug(f"处理文件 {file_path.name} 时出错: {e}")
+                            # 关键优化：立即裁剪 Nino3.4 区域
+                            # Nino3.4: 5S-5N, 190E-240E
+                            da_nino = da.sel(lat=slice(-5, 5), lon=slice(190, 240))
+                            if da_nino.size == 0:
+                                da_nino = da.sel(lat=slice(5, -5), lon=slice(190, 240))
+                            
+                            if 'number' not in da_nino.dims:
+                                da_nino = da_nino.expand_dims('number')
+                            
+                            # 关键优化：立即计算空间平均
+                            weights = np.cos(np.deg2rad(da_nino.lat))
+                            da_weighted = da_nino.weighted(weights)
+                            spatial_mean = da_weighted.mean(dim=['lat', 'lon']).load()
+                            
+                            forecast_time = pd.Timestamp(year, month, 1) + pd.DateOffset(months=leadtime)
+                            spatial_mean = spatial_mean.expand_dims(time=[forecast_time])
+                            
+                            monthly_values_list.append(spatial_mean)
+                            
+                    except Exception:
                         continue
             
-            if not monthly_da_list:
-                logger.warning(f"未找到数据: {model} L{leadtime} SST")
+            if not monthly_values_list:
                 return None
             
-            # 拼接数据
-            data = xr.concat(monthly_da_list, dim='time')
+            data = xr.concat(monthly_values_list, dim='time')
             data = data.sortby('time')
+            data = data.astype(np.float32)
             
-            logger.info(f"模式 SST 数据加载完成: {model} L{leadtime}, shape={data.shape}")
+            logger.info(f"模式 SST 数据处理完成: {model}, shape={data.shape}")
             return data
             
         except Exception as e:
             logger.error(f"加载模式 SST 数据失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             return None
 
     # ========================== EAWM 指数相关 ==========================
@@ -514,16 +471,7 @@ class IndexAnalyzer:
                                        era5_root: str = '/sas12t1/ffyan/ERA5/daily-nc/single-level/',
                                        year_range: Tuple[int, int] = (1993, 2020)) -> Optional[xr.DataArray]:
         """
-        内存优化版：逐月处理并即时释放内存
-        参考 notebook 中的实现
-        
-        Args:
-            baseline: 气候态基准期
-            era5_root: ERA5数据根目录
-            year_range: 年份范围
-        
-        Returns:
-            Nino3.4指数时间序列 (time,)
+        内存优化版：逐月处理并即时释放内存 (修复 ERA5 经度导致的 NaN)
         """
         try:
             logger.info("启动内存优化模式计算 Nino3.4...")
@@ -531,13 +479,11 @@ class IndexAnalyzer:
             var_dir = Path(era5_root) / var_name
             
             if not var_dir.exists():
-                logger.error(f"变量目录不存在: {var_dir}")
                 return None
             
             start_year, end_year = year_range
-            nino34_timeseries = []  # 只存储最终的时间序列值，不存网格数据
+            nino34_timeseries = []
             
-            # 逐月读取处理
             for year in range(start_year, end_year + 1):
                 for month in range(1, 13):
                     file_path = var_dir / f"era5_daily_{var_name}_{year}{month:02d}.nc"
@@ -546,38 +492,41 @@ class IndexAnalyzer:
                     
                     try:
                         with xr.open_dataset(file_path) as ds:
-                            # 查找SST变量
                             sst_vars = ['sst', 'tos', 'sea_surface_temperature', 'SST', 'TOS']
                             actual_var = None
                             for candidate in sst_vars:
                                 if candidate in ds:
                                     actual_var = candidate
                                     break
-                            
                             if actual_var is None:
                                 continue
                             
                             da = ds[actual_var]
                             
-                            # 1. 先裁剪区域 (Nino3.4: 5S-5N, 190E-240E)
                             if 'latitude' in da.coords:
                                 da = da.rename({'latitude': 'lat'})
                             if 'longitude' in da.coords:
                                 da = da.rename({'longitude': 'lon'})
+                            
+                            # 关键修复：ERA5 经度 - 若为 -180~180 则转为 0-360
+                            if da.lon.min() < 0:
+                                da.coords['lon'] = (da.coords['lon'] + 360) % 360
+                                da = da.sortby('lon')
+                            
                             da = da.sortby('lat')
                             da_sub = da.sel(lat=slice(-5, 5), lon=slice(190, 240))
                             
                             if da_sub.size == 0:
-                                logger.debug(f"区域裁剪后无数据: {year}-{month:02d}")
+                                logger.warning(f"ERA5 区域裁剪后为空: {year}-{month}")
                                 continue
                             
-                            # 2. 计算月平均 (将每天的数据压缩为一个值)
                             da_mon = da_sub.resample(time='1MS').mean('time')
-                            
-                            # 3. 计算区域加权平均
                             weights = np.cos(np.deg2rad(da_mon.lat))
                             da_weighted = da_mon.weighted(weights)
-                            mean_val = da_weighted.mean(dim=['lat', 'lon']).load()  # load() 将极小的数据读入内存
+                            mean_val = da_weighted.mean(dim=['lat', 'lon']).load()
+                            
+                            if np.isnan(mean_val.values).all():
+                                logger.warning(f"ERA5 计算结果为 NaN: {year}-{month}")
                             
                             nino34_timeseries.append(mean_val)
                             
@@ -586,32 +535,25 @@ class IndexAnalyzer:
                         continue
             
             if not nino34_timeseries:
-                logger.warning("未找到有效的Nino3.4数据")
                 return None
             
-            # 合并时间序列
             nino34_da = xr.concat(nino34_timeseries, dim='time').sortby('time')
             
-            # 计算距平 (Anomaly)
             start_year_str, end_year_str = baseline.split('-')
             clim_data = nino34_da.sel(time=slice(f"{start_year_str}-01-01", f"{end_year_str}-12-31"))
             clim = clim_data.groupby('time.month').mean('time')
             nino34_anom = nino34_da.groupby('time.month') - clim
             
-            nino34_anom.name = 'nino34_index'
-            nino34_anom.attrs = {
-                'long_name': 'Nino3.4 Index',
-                'description': 'SST anomaly in Nino3.4 region (5N-5S, 190-240E)',
-                'units': 'K'
-            }
+            if np.isnan(nino34_anom.values).all():
+                logger.error("严重错误：ERA5 Nino3.4 指数全是 NaN！")
+            else:
+                logger.info(f"ERA5 Nino3.4 计算成功，有效值数量: {np.sum(~np.isnan(nino34_anom.values))}")
             
-            logger.info("内存优化模式计算 Nino3.4 完成")
+            nino34_anom.name = 'nino34_index'
             return nino34_anom
             
         except Exception as e:
-            logger.error(f"内存优化模式计算 Nino3.4 失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"ERA5 计算失败: {e}")
             return None
 
     def compute_nino34_index(self, sst_monthly: xr.DataArray, baseline: str = CLIMATOLOGY_PERIOD) -> Optional[xr.DataArray]:
@@ -820,31 +762,42 @@ class IndexAnalyzer:
 
     def plot_eawm_index_timeseries(self, index_dict: Dict[str, xr.DataArray], output_file: Path):
         """
-        绘制EAWM指数时间序列图 (MMM风格)
+        绘制EAWM指数时间序列图 (修复 NaN 导致不显示：过滤 NaN 并正确算相关)
         """
         try:
             logger.info("绘制 EAWM 指数时间序列...")
             
-            # 将所有数据转换为DataFrame以便处理 (Annual/DJF year based)
-            # EAWM 只有 DJF，这里假设数据已经是年/季度的
-            # 数据预处理：转换为 DataFrame，index 为 DJF Year
             data_frames = {}
             for name, da in index_dict.items():
-                # 假设 da.time 指向 DJF 的中间月份 (Jan) 或者 起始 (Dec)
-                # 简单起见，提取年份。注意：DJF 1993 通常指 1993/12, 1994/01, 1994/02 -> 归属 1993 或 1994
-                # 这里的逻辑应与 calculate 一致。假设 da.time 已经是 DJF 均值的时间点
-                years = [t.year if t.month > 6 else t.year - 1 for t in pd.DatetimeIndex(da.time.values)]
-                df = pd.Series(da.values, index=years, name=name)
-                data_frames[name] = df
+                if da is None or da.size == 0:
+                    continue
+                times = pd.DatetimeIndex(da.time.values)
+                values = da.values
+                years = []
+                for t in times:
+                    if t.month == 12:
+                        years.append(t.year)
+                    else:
+                        years.append(t.year - 1)
+                s = pd.Series(values, index=years, name=name)
+                s = s.groupby(level=0).mean()
+                data_frames[name] = s
             
             era5_s = data_frames.get('ERA5')
+            if era5_s is None:
+                logger.warning("绘图缺少 ERA5 数据 (data_frames 中无 'ERA5')，将不绘制 ERA5 折线")
             
             fig, ax = plt.subplots(figsize=(14, 7))
             
             if era5_s is not None:
-                ax.plot(era5_s.index, era5_s.values, color='black', linewidth=2.5, marker='o', markersize=4, label='ERA5', zorder=10)
+                era5_valid = era5_s.dropna()
+                if len(era5_valid) > 0:
+                    ax.plot(era5_valid.index, era5_valid.values,
+                           color='black', linewidth=2.5, marker='o', markersize=4,
+                           label='ERA5', zorder=10)
+                else:
+                    logger.warning("ERA5 数据全为 NaN，无法绘制")
             
-            # 分组 L0 和 L3
             l0_models = [k for k in data_frames.keys() if '_L0' in k]
             l3_models = [k for k in data_frames.keys() if '_L3' in k]
             
@@ -858,14 +811,19 @@ class IndexAnalyzer:
                     if era5_s is not None:
                         common = era5_s.index.intersection(mmm.index)
                         if len(common) > 2:
-                            try:
-                                r, _ = pearsonr(era5_s.loc[common], mmm.loc[common])
-                                corr_str = f' [r={r:.2f}]'
-                            except: pass
+                            v1 = era5_s.loc[common]
+                            v2 = mmm.loc[common]
+                            mask = ~np.isnan(v1) & ~np.isnan(v2)
+                            if np.sum(mask) > 2:
+                                try:
+                                    r, _ = pearsonr(v1[mask], v2[mask])
+                                    corr_str = f' [r={r:.2f}]'
+                                except Exception:
+                                    pass
                     
-                    ax.plot(mmm.index, mmm.values, color=color, linewidth=2, linestyle='-' if leadtime==0 else '--',
-                            marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
-                    ax.fill_between(mmm.index, mmm-std, mmm+std, color=color, alpha=0.2, label=f'±1σ Spread ({name})')
+                    ax.plot(mmm.index, mmm.values, color=color, linewidth=2, linestyle='-' if leadtime == 0 else '--',
+                            marker='o' if leadtime == 0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
+                    ax.fill_between(mmm.index, mmm - std, mmm + std, color=color, alpha=0.2, label=f'±1σ Spread ({name})')
 
             ax.tick_params(axis='both', labelsize=20)
             ax.set_ylabel('EAWM Index (Standardized)', fontsize=20, fontweight='bold')
@@ -916,14 +874,15 @@ class IndexAnalyzer:
             else:
                 logger.warning(f"无法加载 {model} L{leadtime} U500 数据")
             
-            # Nino3.4 (SST)
-            sst_model = self.load_model_sst_monthly(model, leadtime)
-            if sst_model is not None:
-                # 如果有number维度，先计算ensemble mean
-                if 'number' in sst_model.dims:
-                    sst_model = sst_model.mean(dim='number')
-                nino34_index = self.compute_nino34_index(sst_model)
-                if nino34_index is None:
+            # Nino3.4 (SST)：load_model_sst_monthly 已直接返回 Nino3.4 区域平均
+            sst_index_raw = self.load_model_sst_monthly(model, leadtime)
+            if sst_index_raw is not None:
+                if 'number' in sst_index_raw.dims:
+                    sst_index_raw = sst_index_raw.mean(dim='number')
+                nino34_index = self.compute_monthly_anomaly(sst_index_raw)
+                if nino34_index is not None:
+                    nino34_index.name = 'nino34_index'
+                else:
                     logger.warning(f"无法计算 {model} L{leadtime} Nino3.4指数")
             else:
                 logger.warning(f"无法加载 {model} L{leadtime} SST 数据")
@@ -960,7 +919,7 @@ class IndexAnalyzer:
             eawm_file = results_dir / "circulation_obs_eawm_index.nc"
             if eawm_file.exists():
                 try:
-                    eawm_era5 = xr.open_dataarray(eawm_file)
+                    eawm_era5 = xr.open_dataarray(eawm_file).load()
                     logger.info("已加载 ERA5 EAWM 指数文件")
                 except Exception as e:
                     logger.warning(f"加载 EAWM 指数文件失败: {e}")
@@ -1092,6 +1051,8 @@ class IndexAnalyzer:
 
         # 4. 绘图
         if len(eawm_indices) > 0:
+            if 'ERA5' not in eawm_indices:
+                logger.warning("eawm_indices 中缺少 ERA5，图中将无 ERA5 折线；请检查 results/circulation_obs_eawm_index.nc 是否存在且可读")
             self.plot_eawm_index_timeseries(eawm_indices, plots_dir / "circulation_eawm_index_mmm.png")
         
         if len(nino34_indices) > 0:
