@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-季节性预报方案误差分析模块 (RMSE, MAE, Bias) (V4 - Seasonal Boxplots & Dynamic Time)
+季节性预报方案误差分析模块 (RMSE, MAE, Bias) (V5 - Seasonal Violinplots & Dynamic Time)
 修改内容：
 1. 集成命令行参数 --plot-only，支持跳过计算直接绘图。
 2. 引入数据缓存机制 (pickle)。
 3. 移除硬编码的 MONTH_MAPPING，使用模运算动态计算 lead_time。
 4. 将硬编码的跨年逻辑 (DJF 12月 +1) 下沉为动态的 seasonal_year 分配，彻底解耦 time 坐标处理。
-5. 将月度折线图替换为以季节为横轴的箱线散点图 (Boxplot + Scatter)，全面展示成员不确定性 (Spread)、单模式和MMM。
+5. 将可视化图表从箱线图升级为 小提琴图 (Violin Plot + Scatter)，更清晰地展示成员分布的密度。
 6. 区域数据计算升级为：先空间拼接成季节场，求面积加权区域平均，最后沿“年份(Year)”计算季节误差指标。
+7. 统一纵坐标轴：自动计算全局极值，所有子图纵轴范围完全一致，并保留一位小数格式化。
 
 定义：
 - Short-term (L0-2): 使用起报当月(L0)、+1月(L1)、+2月(L2)的数据合成目标季节。
@@ -27,7 +28,7 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 import regionmask
-import seaborn as sns  # 引入 seaborn 用于绘制箱线图
+import seaborn as sns  # 引入 seaborn 用于绘制小提琴图
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FixedLocator
 # === Cartopy 相关导入 ===
@@ -436,10 +437,11 @@ class SeasonalSchemeErrorAnalyzer:
             plt.savefig(self.plot_dir / f"{metric}_map_{season}_{self.var_type}.png", dpi=300, bbox_inches='tight')
             plt.close()
 
-    def plot_seasonal_regional_boxplot(self, seasonal_reg_res, mmm_seasonal_res, metric, title_metric):
+    def plot_seasonal_regional_violinplot(self, seasonal_reg_res, mmm_seasonal_res, metric, title_metric):
         """
-        绘制季节区域误差指标的箱线散点图 (Boxplot + Scatter)
-        展示 All members spread, 各模式均值, 以及 MMM
+        绘制季节区域误差指标的小提琴散点图 (Violinplot + Scatter)
+        展示 All members spread (核密度分布), 各模式均值, 以及 MMM
+        所有子图共用相同的纵坐标范围 (保留一位小数)。
         """
         regions_order = ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast', 
                          'Z4-Tibetan', 'Z5-NorthChina', 'Z6-Yangtze', 
@@ -448,7 +450,49 @@ class SeasonalSchemeErrorAnalyzer:
         seasons = ['DJF', 'MAM', 'JJA', 'SON']
         
         for scheme in SCHEMES:
-            logger.info(f"绘制季节箱线图 ({metric}): {scheme}")
+            logger.info(f"绘制季节小提琴图 ({metric}): {scheme}")
+            
+            # --- 计算全局纵坐标范围 (Global Min/Max) 以保证所有子图一致 ---
+            global_min = float('inf')
+            global_max = float('-inf')
+            
+            for reg in regions_to_plot:
+                for season in seasons:
+                    # 搜集所有模式及成员的最值
+                    for model in MODELS:
+                        data = seasonal_reg_res[scheme].get(model, {}).get(reg, {}).get(season, {})
+                        if 'members' in data and metric in data['members']:
+                            valid = [v for v in data['members'][metric] if np.isfinite(v)]
+                            if valid:
+                                global_min = min(global_min, min(valid))
+                                global_max = max(global_max, max(valid))
+                        
+                        val = data.get(metric, np.nan)
+                        if np.isfinite(val):
+                            global_min = min(global_min, val)
+                            global_max = max(global_max, val)
+                    
+                    # 搜集 MMM 的最值
+                    mmm_val = mmm_seasonal_res[scheme].get(reg, {}).get(season, {}).get(metric, np.nan)
+                    if np.isfinite(mmm_val):
+                        global_min = min(global_min, mmm_val)
+                        global_max = max(global_max, mmm_val)
+                        
+            # 如果全是NaN的极端防错处理
+            if np.isinf(global_min): global_min = 0
+            if np.isinf(global_max): global_max = 1
+            
+            padding = (global_max - global_min) * 0.05
+            if padding == 0: padding = 0.1
+            
+            # RMSE 和 MAE 下限强制为0，Bias 则根据极值两边留白
+            if metric in ['rmse', 'mae']:
+                y_min = 0
+            else:
+                y_min = global_min - padding
+            y_max = global_max + padding
+
+            # --- 开始绘图 ---
             fig, axes = plt.subplots(3, 3, figsize=(18, 15))
             axes = axes.flatten()
             cmap = plt.get_cmap('tab10')
@@ -460,7 +504,7 @@ class SeasonalSchemeErrorAnalyzer:
                 spread_data = []
                 spread_labels = []
                 
-                # 1. 收集所有 member 的值以绘制底层箱线图
+                # 1. 收集所有 member 的值以绘制底层小提琴图
                 for season in seasons:
                     season_mems = []
                     for model in MODELS:
@@ -473,9 +517,11 @@ class SeasonalSchemeErrorAnalyzer:
                     spread_labels.extend([season] * len(season_mems))
                 
                 if spread_data:
-                    sns.boxplot(x=spread_labels, y=spread_data, ax=ax, 
-                                color='lightgray', width=0.5, 
-                                boxprops=dict(alpha=0.6), showfliers=False, zorder=1)
+                    # 使用小提琴图替代箱线图
+                    # inner=None 取消内部箱线图，cut=0 限制 KDE 不超出真实数据范围 (防止负 RMSE)
+                    sns.violinplot(x=spread_labels, y=spread_data, ax=ax, 
+                                   color='lightgray', inner=None, linewidth=1, 
+                                   cut=0, zorder=1)
                 
                 if metric == 'bias':
                     ax.axhline(0, color='black', linewidth=1.0, linestyle='--', zorder=0)
@@ -506,8 +552,9 @@ class SeasonalSchemeErrorAnalyzer:
                 ax.set_xticklabels(seasons, fontsize=14)
                 ax.grid(axis='y', linestyle=':', alpha=0.6)
                 
-                if metric in ['rmse', 'mae']:
-                    ax.set_ylim(bottom=0)
+                # 设置统一的 y 轴范围并强制保留一位小数
+                ax.set_ylim(y_min, y_max)
+                ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
                 
                 if i % 3 == 0: 
                     ax.set_ylabel(f'Seasonal {title_metric} ({self.unit_label})', fontsize=14)
@@ -526,7 +573,7 @@ class SeasonalSchemeErrorAnalyzer:
             plt.subplots_adjust(top=0.92, bottom=0.10, hspace=0.3, wspace=0.2)
             plt.suptitle(f"Regional Seasonal {title_metric} Distribution ({scheme}) - {self.var_type}", fontsize=22, fontweight='bold', y=0.97)
             
-            plt.savefig(self.plot_dir / f"seasonal_{metric}_boxplot_{scheme}_{self.var_type}.png", dpi=300, bbox_inches='tight')
+            plt.savefig(self.plot_dir / f"seasonal_{metric}_violinplot_{scheme}_{self.var_type}.png", dpi=300, bbox_inches='tight')
             plt.close()
 
 
@@ -562,7 +609,7 @@ class SeasonalSchemeErrorAnalyzer:
             cache = self._load_cache()
             for metric, title in [('rmse', 'RMSE'), ('mae', 'MAE'), ('bias', 'Bias')]:
                 self.plot_seasonal_spatial_maps(cache['results_map'], metric, title)
-                self.plot_seasonal_regional_boxplot(cache['seasonal_reg_res'], cache['mmm_res'], metric, title)
+                self.plot_seasonal_regional_violinplot(cache['seasonal_reg_res'], cache['mmm_res'], metric, title)
             return
 
         logger.info("开始计算空间分布数据 (四季)...")
@@ -589,7 +636,7 @@ class SeasonalSchemeErrorAnalyzer:
         
         for metric, title in [('rmse', 'RMSE'), ('mae', 'MAE'), ('bias', 'Bias')]:
             self.plot_seasonal_spatial_maps(results_map, metric, title)
-            self.plot_seasonal_regional_boxplot(seasonal_reg_res, mmm_res, metric, title)
+            self.plot_seasonal_regional_violinplot(seasonal_reg_res, mmm_res, metric, title)
 
 def main():
     parser = create_parser(description="季节预报方案误差分析", var_default=None, var_required=False)

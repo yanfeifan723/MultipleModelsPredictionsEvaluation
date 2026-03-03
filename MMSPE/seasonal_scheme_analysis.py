@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-季节性预报方案 Pearson 相关系数分析模块 (V4 - Seasonal Boxplots & Dynamic Time)
+季节性预报方案 Pearson 相关系数分析模块 (V5 - Seasonal Violinplots & Dynamic Time)
 修改内容：
 1. 移除硬编码的 MONTH_MAPPING，使用模运算动态计算 lead_time。
 2. 将硬编码的跨年逻辑 (DJF 12月 +1) 下沉为动态的 seasonal_year 分配，彻底解耦 time 坐标处理。
-3. 将月度折线图替换为以季节为横轴的箱线散点图 (Boxplot + Scatter)，全面展示成员不确定性 (Spread)、单模式和MMM。
+3. 将月度折线图替换为以季节为横轴的小提琴散点图 (Violin Plot + Scatter)，全面展示成员密度分布 (Spread)、单模式和MMM。
 4. 区域数据计算升级为：先空间拼接成季节场，求面积加权区域平均，最后沿“年份(Year)”计算季节ACC。
+5. 新增统一纵坐标轴：自动计算全局极值，所有子图纵轴范围完全一致，并保留一位小数格式化。
 """
 
 import sys
@@ -21,7 +22,7 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 import scipy.stats as stats
-import seaborn as sns  # 引入 seaborn 用于绘制箱线图
+import seaborn as sns  # 引入 seaborn 用于绘制小提琴图
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FixedLocator
 import cartopy.crs as ccrs
@@ -104,7 +105,7 @@ def pearson_r_along_time_with_p(x, y):
     except: return np.nan, np.nan
 
 class SeasonalSchemePearsonAnalyzerV3:
-    """季节预报方案 ACC 分析器 (V4 - Boxplots)"""
+    """季节预报方案 ACC 分析器 (V5 - Violinplots)"""
     
     def __init__(self, var_type: str, n_jobs: Optional[int] = None):
         self.var_type = var_type
@@ -420,10 +421,11 @@ class SeasonalSchemePearsonAnalyzerV3:
             plt.savefig(self.plot_dir / f"acc_map_{season}_{self.var_type}.png", dpi=300, bbox_inches='tight', pad_inches=0.1)
             plt.close()
 
-    def plot_seasonal_regional_boxplot(self, seasonal_reg_res, mmm_seasonal_res):
+    def plot_seasonal_regional_violinplot(self, seasonal_reg_res, mmm_seasonal_res):
         """
-        绘制季节区域 ACC 的箱线散点图 (Boxplot + Scatter)
-        横轴为 4 个季节，呈现 Spread、单模式均值、和 MMM
+        绘制季节区域 ACC 的小提琴散点图 (Violinplot + Scatter)
+        横轴为 4 个季节，呈现 Spread (核密度分布)、单模式均值、和 MMM
+        所有子图共用相同的纵坐标范围 (保留一位小数)。
         """
         regions_order = ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast', 
                          'Z4-Tibetan', 'Z5-NorthChina', 'Z6-Yangtze', 
@@ -433,7 +435,45 @@ class SeasonalSchemePearsonAnalyzerV3:
         seasons = ['DJF', 'MAM', 'JJA', 'SON']
         
         for scheme in SCHEMES:
-            logger.info(f"绘制季节箱线图: {scheme}")
+            logger.info(f"绘制季节小提琴图: {scheme}")
+            
+            # --- 计算全局纵坐标范围 (Global Min/Max) 以保证所有子图一致 ---
+            global_min = float('inf')
+            global_max = float('-inf')
+            
+            for reg in regions_to_plot:
+                for season in seasons:
+                    # 搜集所有模式及成员的最值
+                    for model in MODELS:
+                        data = seasonal_reg_res[scheme].get(model, {}).get(reg, {}).get(season, {})
+                        if 'members' in data and data['members']:
+                            valid = [v for v in data['members'] if np.isfinite(v)]
+                            if valid:
+                                global_min = min(global_min, min(valid))
+                                global_max = max(global_max, max(valid))
+                        
+                        val = data.get('acc', np.nan)
+                        if np.isfinite(val):
+                            global_min = min(global_min, val)
+                            global_max = max(global_max, val)
+                    
+                    # 搜集 MMM 的最值
+                    mmm_val = mmm_seasonal_res[scheme].get(reg, {}).get(season, np.nan)
+                    if np.isfinite(mmm_val):
+                        global_min = min(global_min, mmm_val)
+                        global_max = max(global_max, mmm_val)
+                        
+            # ACC 极端防错与边界限制 (ACC 理论范围是 -1 到 1)
+            if np.isinf(global_min): global_min = -1.0
+            if np.isinf(global_max): global_max = 1.0
+            
+            padding = (global_max - global_min) * 0.05
+            if padding == 0: padding = 0.1
+            
+            y_min = max(-1.0, global_min - padding)
+            y_max = min(1.0, global_max + padding)
+
+            # --- 开始绘图 ---
             fig, axes = plt.subplots(3, 3, figsize=(18, 15))
             axes = axes.flatten()
             cmap = plt.get_cmap('tab10')
@@ -445,7 +485,7 @@ class SeasonalSchemePearsonAnalyzerV3:
                 spread_data = []
                 spread_labels = []
                 
-                # 1. 收集所有 member 的值以绘制底层箱线图
+                # 1. 收集所有 member 的值以绘制底层小提琴图
                 for season in seasons:
                     season_mems = []
                     for model in MODELS:
@@ -458,9 +498,10 @@ class SeasonalSchemePearsonAnalyzerV3:
                     spread_labels.extend([season] * len(season_mems))
                 
                 if spread_data:
-                    sns.boxplot(x=spread_labels, y=spread_data, ax=ax, 
-                                color='lightgray', width=0.5, 
-                                boxprops=dict(alpha=0.6), showfliers=False, zorder=1)
+                    # 使用小提琴图，去除内部箱线图 (inner=None)，防止KDE超界 (cut=0)
+                    sns.violinplot(x=spread_labels, y=spread_data, ax=ax, 
+                                   color='lightgray', inner=None, linewidth=1, 
+                                   cut=0, zorder=1)
 
                 ax.axhline(0, color='black', linewidth=1.0, linestyle='--', zorder=0)
 
@@ -489,13 +530,16 @@ class SeasonalSchemePearsonAnalyzerV3:
                 ax.set_xticks(np.arange(len(seasons)))
                 ax.set_xticklabels(seasons, fontsize=14)
                 ax.grid(axis='y', linestyle=':', alpha=0.6)
-                ax.set_ylim(-0.6, 1.0)
+                
+                # 统一的 y 轴范围及保留一位小数
+                ax.set_ylim(y_min, y_max)
+                ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
                 
                 if i % 3 == 0: 
                     ax.set_ylabel('Seasonal ACC', fontsize=14)
                 ax.tick_params(labelsize=12)
 
-            # 提取并重组图例，确保 MMM 星星在最右或显眼位置
+            # 提取并重组图例，确保 MMM 星星在最显眼位置
             handles, labels = axes[0].get_legend_handles_labels()
             if 'MMM' in labels:
                 mmm_idx = labels.index('MMM')
@@ -508,7 +552,7 @@ class SeasonalSchemePearsonAnalyzerV3:
             plt.subplots_adjust(top=0.92, bottom=0.10, hspace=0.3, wspace=0.2)
             plt.suptitle(f"Regional Seasonal ACC Distribution ({scheme}) - {self.var_type}", fontsize=22, fontweight='bold', y=0.97)
             
-            plt.savefig(self.plot_dir / f"seasonal_acc_boxplot_{scheme}_{self.var_type}.png", dpi=300, bbox_inches='tight')
+            plt.savefig(self.plot_dir / f"seasonal_acc_violinplot_{scheme}_{self.var_type}.png", dpi=300, bbox_inches='tight')
             plt.close()
 
     def _process_spatial_task(self, model, scheme, season):
@@ -543,7 +587,7 @@ class SeasonalSchemePearsonAnalyzerV3:
             logger.info("--plot-only 模式: 从缓存加载数据并仅绘图")
             cache = self._load_cache()
             self.plot_seasonal_spatial_maps(cache['results_map'])
-            self.plot_seasonal_regional_boxplot(cache['seasonal_reg_res'], cache['mmm_res'])
+            self.plot_seasonal_regional_violinplot(cache['seasonal_reg_res'], cache['mmm_res'])
             return
 
         logger.info("开始计算空间分布数据 (四季)...")
@@ -569,7 +613,7 @@ class SeasonalSchemePearsonAnalyzerV3:
         mmm_res = {s: self.calculate_mmm_seasonal_acc(s) for s in SCHEMES}
         
         self._save_cache(results_map, seasonal_reg_res, mmm_res)
-        self.plot_seasonal_regional_boxplot(seasonal_reg_res, mmm_res)
+        self.plot_seasonal_regional_violinplot(seasonal_reg_res, mmm_res)
 
 def main():
     parser = create_parser(description="季节预报方案 ACC 分析", var_default=None, var_required=False)
