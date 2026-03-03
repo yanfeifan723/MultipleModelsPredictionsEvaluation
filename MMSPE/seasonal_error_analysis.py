@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-季节性预报方案误差分析模块 (RMSE, MAE, Bias) (Style Updated & Cached)
+季节性预报方案误差分析模块 (RMSE, MAE, Bias) (V4 - Seasonal Boxplots & Dynamic Time)
 修改内容：
 1. 集成命令行参数 --plot-only，支持跳过计算直接绘图。
 2. 引入数据缓存机制 (pickle)。
-3. plot_monthly_timeseries 风格完全对齐 combined_error_analysis.py。
-4. 引入 Multi-model Member Spread (灰色背景)。
+3. 移除硬编码的 MONTH_MAPPING，使用模运算动态计算 lead_time。
+4. 将硬编码的跨年逻辑 (DJF 12月 +1) 下沉为动态的 seasonal_year 分配，彻底解耦 time 坐标处理。
+5. 将月度折线图替换为以季节为横轴的箱线散点图 (Boxplot + Scatter)，全面展示成员不确定性 (Spread)、单模式和MMM。
+6. 区域数据计算升级为：先空间拼接成季节场，求面积加权区域平均，最后沿“年份(Year)”计算季节误差指标。
 
 定义：
 - Short-term (L0-2): 使用起报当月(L0)、+1月(L1)、+2月(L2)的数据合成目标季节。
@@ -25,6 +27,7 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 import regionmask
+import seaborn as sns  # 引入 seaborn 用于绘制箱线图
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FixedLocator
 # === Cartopy 相关导入 ===
@@ -52,13 +55,26 @@ from common_config import (
 MODELS = MODEL_LIST
 SCHEMES = ['Short-term', 'Long-term']
 
-# 月份映射关系 (Month -> Season, Short Lead, Long Lead)
-MONTH_MAPPING = {
-    1:  ('DJF', 1, 4), 2:  ('DJF', 2, 5), 3:  ('MAM', 0, 3),
-    4:  ('MAM', 1, 4), 5:  ('MAM', 2, 5), 6:  ('JJA', 0, 3),
-    7:  ('JJA', 1, 4), 8:  ('JJA', 2, 5), 9:  ('SON', 0, 3),
-    10: ('SON', 1, 4), 11: ('SON', 2, 5), 12: ('DJF', 0, 3)
+# === 动态时间计算配置 ===
+# 方案相对于季节起始月份的初始化提前量 (月)
+SCHEME_OFFSETS = {
+    'Short-term': 0, 
+    'Long-term': 3   
 }
+
+def get_season_for_month(target_month: int) -> str:
+    """根据目标月份动态判断所属季节"""
+    for season, months in SEASONS.items():
+        if target_month in months:
+            return season
+    return 'DJF'
+
+def get_dynamic_lead_time(target_month: int, season: str, scheme: str) -> int:
+    """利用数学取模动态计算所需预报时效，消除查表硬编码"""
+    season_start_month = SEASONS[season][0]
+    # 取模处理能完美解决跨年月份计算 (如 1月 - 12月 -> (1 - 12) % 12 = 1)
+    month_diff = (target_month - season_start_month) % 12
+    return month_diff + SCHEME_OFFSETS.get(scheme, 0)
 
 # 区域定义
 def generate_regions():
@@ -126,10 +142,11 @@ class SeasonalSchemeErrorAnalyzer:
             return ds
 
     def load_monthly_data(self, model: str, scheme: str, target_month: int):
-        """加载月度数据 (包含单位转换和Mask)"""
+        """加载月度数据 (包含单位转换、Mask和动态年份处理)"""
         try:
-            scheme_idx = 1 if scheme == 'Short-term' else 2 
-            lead_time = MONTH_MAPPING[target_month][scheme_idx]
+            # === 1. 动态获取 Lead Time ===
+            season = get_season_for_month(target_month)
+            lead_time = get_dynamic_lead_time(target_month, season, scheme)
             
             # 加载观测
             obs_full = self.data_loader.load_obs_data(self.var_type)
@@ -160,8 +177,13 @@ class SeasonalSchemeErrorAnalyzer:
             obs_m = self.apply_land_mask(self.convert_temp_units(obs_m))
             fcst_m = self.apply_land_mask(self.convert_temp_units(fcst_m))
             
-            obs_m = obs_m.assign_coords(year=('time', obs_m.time.dt.year.values))
-            fcst_m = fcst_m.assign_coords(year=('time', fcst_m.time.dt.year.values))
+            # === 2. 动态年份(季节)映射消除硬编码跨年逻辑 ===
+            is_cross_year = (season == 'DJF' and target_month == 12)
+            year_offset = 1 if is_cross_year else 0
+            
+            obs_m = obs_m.assign_coords(year=('time', obs_m.time.dt.year.values + year_offset))
+            fcst_m = fcst_m.assign_coords(year=('time', fcst_m.time.dt.year.values + year_offset))
+            
             obs_m = obs_m.swap_dims({'time': 'year'}).drop_vars('time')
             fcst_m = fcst_m.swap_dims({'time': 'year'}).drop_vars('time')
             
@@ -180,10 +202,7 @@ class SeasonalSchemeErrorAnalyzer:
                 o, f = self.load_monthly_data(model, scheme, m)
                 if o is None or f is None: return None, None
                 
-                if season == 'DJF' and m == 12:
-                    o = o.assign_coords(year=o.year + 1)
-                    f = f.assign_coords(year=f.year + 1)
-                
+                # 由于底层 load_monthly_data 已经动态处理了跨年偏移，此处直接合并
                 obs_list.append(o)
                 fcst_list.append(f)
             
@@ -205,7 +224,7 @@ class SeasonalSchemeErrorAnalyzer:
             return None, None
 
     def calculate_pointwise_metrics(self, obs: xr.DataArray, fcst: xr.DataArray) -> xr.Dataset:
-        """计算逐格点指标 (Time Mean)"""
+        """计算逐格点指标 (Time Mean) 用作空间绘图"""
         if 'number' in fcst.dims: fcst = fcst.mean(dim='number')
         diff = fcst - obs
         rmse = np.sqrt((diff ** 2).mean(dim='year', skipna=True))
@@ -213,30 +232,32 @@ class SeasonalSchemeErrorAnalyzer:
         mae = np.abs(diff).mean(dim='year', skipna=True)
         return xr.Dataset({'rmse': rmse, 'bias': bias, 'mae': mae})
 
-    def calculate_monthly_regional_metrics(self, model: str, scheme: str):
-        """计算月度区域指标"""
+    def calculate_seasonal_regional_metrics(self, model: str, scheme: str):
+        """计算区域的季节平均误差，包含 Ensemble Mean 和 Members"""
         results = {reg: {} for reg in REGIONS}
-        for m in range(1, 13):
-            obs, fcst = self.load_monthly_data(model, scheme, m)
-            if obs is None: continue
+        seasons = ['DJF', 'MAM', 'JJA', 'SON']
+        
+        for season in seasons:
+            obs_seasonal, fcst_seasonal = self.construct_seasonal_data(model, scheme, season)
+            if obs_seasonal is None: continue
             
-            weights = np.cos(np.deg2rad(obs.lat))
-            if 'number' in fcst.dims:
-                fcst_mean = fcst.mean(dim='number')
-                fcst_mems = fcst
+            weights = np.cos(np.deg2rad(obs_seasonal.lat))
+            if 'number' in fcst_seasonal.dims:
+                fcst_mean = fcst_seasonal.mean(dim='number')
+                fcst_mems = fcst_seasonal
             else:
-                fcst_mean = fcst
+                fcst_mean = fcst_seasonal
                 fcst_mems = None
             
             for reg_name, bounds in REGIONS.items():
                 if bounds:
-                    lat_sl = slice(bounds['lat'][0], bounds['lat'][1]) if obs.lat[0] < obs.lat[-1] else slice(bounds['lat'][1], bounds['lat'][0])
+                    lat_sl = slice(bounds['lat'][0], bounds['lat'][1]) if obs_seasonal.lat[0] < obs_seasonal.lat[-1] else slice(bounds['lat'][1], bounds['lat'][0])
                     lon_sl = slice(bounds['lon'][0], bounds['lon'][1])
-                    obs_reg = obs.sel(lat=lat_sl, lon=lon_sl)
+                    obs_reg = obs_seasonal.sel(lat=lat_sl, lon=lon_sl)
                     fcst_reg = fcst_mean.sel(lat=lat_sl, lon=lon_sl)
                     fcst_mem_reg = fcst_mems.sel(lat=lat_sl, lon=lon_sl) if fcst_mems is not None else None
                 else:
-                    obs_reg = obs; fcst_reg = fcst_mean; fcst_mem_reg = fcst_mems
+                    obs_reg = obs_seasonal; fcst_reg = fcst_mean; fcst_mem_reg = fcst_mems
                 
                 w_reg = weights.sel(lat=obs_reg.lat)
                 
@@ -246,7 +267,7 @@ class SeasonalSchemeErrorAnalyzer:
                 mae = np.abs(diff_mean).weighted(w_reg).mean(dim=['lat', 'lon'], skipna=True).mean(dim='year', skipna=True).item()
                 bias = diff_mean.weighted(w_reg).mean(dim=['lat', 'lon'], skipna=True).mean(dim='year', skipna=True).item()
                 
-                # Member Metrics (flattened)
+                # Member Metrics (flattened into lists)
                 mem_metrics = {'rmse': [], 'mae': [], 'bias': []}
                 if fcst_mem_reg is not None:
                     diff_mem = fcst_mem_reg - obs_reg # (year, number, lat, lon)
@@ -259,19 +280,21 @@ class SeasonalSchemeErrorAnalyzer:
                     mem_metrics['mae'] = mae_mem.values.tolist()
                     mem_metrics['bias'] = bias_mem.values.tolist()
                 
-                results[reg_name][m] = {
+                results[reg_name][season] = {
                     'rmse': rmse, 'mae': mae, 'bias': bias,
                     'members': mem_metrics
                 }
         return results
 
-    def calculate_mmm_monthly_metrics(self, scheme: str):
-        """计算 MMM 的月度区域指标"""
+    def calculate_mmm_seasonal_metrics(self, scheme: str):
+        """计算 Multi-Model Mean (MMM) 的季节区域误差"""
         results = {reg: {} for reg in REGIONS}
-        for m in range(1, 13):
+        seasons = ['DJF', 'MAM', 'JJA', 'SON']
+        
+        for season in seasons:
             obs_sample, fcst_list = None, []
             for model in MODELS:
-                o, f = self.load_monthly_data(model, scheme, m)
+                o, f = self.construct_seasonal_data(model, scheme, season)
                 if o is None: continue
                 if obs_sample is None: obs_sample = o
                 common = np.intersect1d(obs_sample.year, f.year)
@@ -303,7 +326,7 @@ class SeasonalSchemeErrorAnalyzer:
                 mae = np.abs(diff).weighted(w_r).mean(dim=['lat', 'lon'], skipna=True).mean(dim='year', skipna=True).item()
                 bias = diff.weighted(w_r).mean(dim=['lat', 'lon'], skipna=True).mean(dim='year', skipna=True).item()
                 
-                results[reg][m] = {'rmse': rmse, 'mae': mae, 'bias': bias}
+                results[reg][season] = {'rmse': rmse, 'mae': mae, 'bias': bias}
         return results
 
     def get_plotting_params(self, metric: str):
@@ -413,86 +436,107 @@ class SeasonalSchemeErrorAnalyzer:
             plt.savefig(self.plot_dir / f"{metric}_map_{season}_{self.var_type}.png", dpi=300, bbox_inches='tight')
             plt.close()
 
-    def plot_monthly_timeseries(self, monthly_reg_res, mmm_res, metric, title_metric):
+    def plot_seasonal_regional_boxplot(self, seasonal_reg_res, mmm_seasonal_res, metric, title_metric):
         """
-        绘制区域月度指标折线图
-        风格: Grey Spread, Colored Lines, Bold MMM
+        绘制季节区域误差指标的箱线散点图 (Boxplot + Scatter)
+        展示 All members spread, 各模式均值, 以及 MMM
         """
         regions_order = ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast', 
                          'Z4-Tibetan', 'Z5-NorthChina', 'Z6-Yangtze', 
                          'Z7-Southwest', 'Z8-SouthChina', 'Z9-SouthSea']
         regions_to_plot = [r for r in regions_order if r in REGIONS]
+        seasons = ['DJF', 'MAM', 'JJA', 'SON']
         
         for scheme in SCHEMES:
-            logger.info(f"绘制折线图 ({metric}): {scheme}")
+            logger.info(f"绘制季节箱线图 ({metric}): {scheme}")
             fig, axes = plt.subplots(3, 3, figsize=(18, 15))
             axes = axes.flatten()
-            months = np.arange(1, 13)
             cmap = plt.get_cmap('tab10')
-
+            
             for i, reg in enumerate(regions_to_plot):
                 if i >= len(axes): break
                 ax = axes[i]
                 
-                # --- Step 1: Spread ---
-                spread_min, spread_max = [], []
-                for m in months:
-                    all_mems = []
+                spread_data = []
+                spread_labels = []
+                
+                # 1. 收集所有 member 的值以绘制底层箱线图
+                for season in seasons:
+                    season_mems = []
                     for model in MODELS:
-                        data = monthly_reg_res[scheme].get(model, {}).get(reg, {}).get(m, {})
+                        data = seasonal_reg_res[scheme].get(model, {}).get(reg, {}).get(season, {})
                         if 'members' in data and metric in data['members']:
-                             valid = [v for v in data['members'][metric] if np.isfinite(v)]
-                             all_mems.extend(valid)
+                            valid = [v for v in data['members'][metric] if np.isfinite(v)]
+                            season_mems.extend(valid)
                     
-                    if all_mems:
-                        spread_min.append(np.min(all_mems))
-                        spread_max.append(np.max(all_mems))
-                    else:
-                        spread_min.append(np.nan)
-                        spread_max.append(np.nan)
+                    spread_data.extend(season_mems)
+                    spread_labels.extend([season] * len(season_mems))
                 
-                ax.fill_between(months, spread_min, spread_max, color='gray', alpha=0.2, 
-                                label='Multi-model Member Spread' if i == 0 else "")
+                if spread_data:
+                    sns.boxplot(x=spread_labels, y=spread_data, ax=ax, 
+                                color='lightgray', width=0.5, 
+                                boxprops=dict(alpha=0.6), showfliers=False, zorder=1)
                 
-                # --- Step 2: Models ---
+                if metric == 'bias':
+                    ax.axhline(0, color='black', linewidth=1.0, linestyle='--', zorder=0)
+
+                # 2. 绘制各个模式 Ensemble Mean 的散点 (加入微小抖动防重叠)
                 for idx, model in enumerate(MODELS):
                     model_vals = []
-                    for m in months:
-                        val = monthly_reg_res[scheme].get(model, {}).get(reg, {}).get(m, {}).get(metric, np.nan)
+                    for season in seasons:
+                        val = seasonal_reg_res[scheme].get(model, {}).get(reg, {}).get(season, {}).get(metric, np.nan)
                         model_vals.append(val)
                     
-                    label = model.replace('-mon','').replace('Meteo-France','MF').replace('ECCC-Canada', 'ECCC-3') if i == 0 else ""
-                    ax.plot(months, model_vals, marker='o', markersize=5, linewidth=2, 
-                            color=cmap(idx % 10), label=label)
+                    x_pos = np.arange(len(seasons)) + np.random.uniform(-0.15, 0.15, size=len(seasons))
+                    display_name = model.replace('-mon','').replace('Meteo-France','MF').replace('ECCC-Canada', 'ECCC-3')
+                    
+                    ax.scatter(x_pos, model_vals, color=cmap(idx % 10), s=60, alpha=0.9, 
+                               edgecolors='white', linewidth=0.5, 
+                               label=display_name if i == 0 else "", zorder=3)
+
+                # 3. 绘制 Multi-Model Mean (MMM) 的黑色大星星
+                mmm_vals = [mmm_seasonal_res[scheme].get(reg, {}).get(season, {}).get(metric, np.nan) for season in seasons]
+                ax.scatter(np.arange(len(seasons)), mmm_vals, color='black', marker='*', 
+                           s=250, edgecolors='white', linewidth=1, 
+                           label='MMM' if i == 0 else "", zorder=4)
                 
-                # --- Step 3: MMM ---
-                mmm_vals = [mmm_res[scheme][reg].get(m, {}).get(metric, np.nan) for m in months]
-                ax.plot(months, mmm_vals, color='black', linewidth=3, label='MMM' if i == 0 else "")
-                
-                # --- Styling ---
+                # 样式设置
                 ax.set_title(reg, fontsize=16, fontweight='bold')
-                ax.set_xticks(months); ax.set_xticklabels([str(m) for m in months])
-                ax.grid(True, linestyle=':', alpha=0.6)
-                if i >= 6: ax.set_xlabel('Month', fontsize=16)
-                if i % 3 == 0: ax.set_ylabel(f'{title_metric} ({self.unit_label})', fontsize=16)
+                ax.set_xticks(np.arange(len(seasons)))
+                ax.set_xticklabels(seasons, fontsize=14)
+                ax.grid(axis='y', linestyle=':', alpha=0.6)
+                
+                if metric in ['rmse', 'mae']:
+                    ax.set_ylim(bottom=0)
+                
+                if i % 3 == 0: 
+                    ax.set_ylabel(f'Seasonal {title_metric} ({self.unit_label})', fontsize=14)
                 ax.tick_params(labelsize=12)
 
+            # 提取并重组图例，确保 MMM 星星在最显眼位置
             handles, labels = axes[0].get_legend_handles_labels()
-            by_label = dict(zip(labels, handles))
-            fig.legend(by_label.values(), by_label.keys(), loc='lower center', 
-                       bbox_to_anchor=(0.5, 0.02), ncol=5, fontsize=14, frameon=False)
+            if 'MMM' in labels:
+                mmm_idx = labels.index('MMM')
+                handles.append(handles.pop(mmm_idx))
+                labels.append(labels.pop(mmm_idx))
+                
+            fig.legend(handles, labels, loc='lower center', 
+                       bbox_to_anchor=(0.5, 0.02), ncol=len(MODELS)+1, fontsize=14, frameon=False)
             
-            plt.subplots_adjust(top=0.95, bottom=0.12, hspace=0.3, wspace=0.2)
-            plt.savefig(self.plot_dir / f"monthly_{metric}_timeseries_{scheme}_{self.var_type}.png", dpi=300, bbox_inches='tight')
+            plt.subplots_adjust(top=0.92, bottom=0.10, hspace=0.3, wspace=0.2)
+            plt.suptitle(f"Regional Seasonal {title_metric} Distribution ({scheme}) - {self.var_type}", fontsize=22, fontweight='bold', y=0.97)
+            
+            plt.savefig(self.plot_dir / f"seasonal_{metric}_boxplot_{scheme}_{self.var_type}.png", dpi=300, bbox_inches='tight')
             plt.close()
+
 
     def _process_spatial_task(self, model, scheme, season):
         obs, fcst = self.construct_seasonal_data(model, scheme, season)
         if obs is None: return None
         return (model, scheme, season, self.calculate_pointwise_metrics(obs, fcst))
 
-    def _process_monthly_task(self, model, scheme):
-        return (model, scheme, self.calculate_monthly_regional_metrics(model, scheme))
+    def _process_seasonal_regional_task(self, model, scheme):
+        return (model, scheme, self.calculate_seasonal_regional_metrics(model, scheme))
 
     def _load_cache(self):
         """从缓存加载计算结果"""
@@ -501,12 +545,12 @@ class SeasonalSchemeErrorAnalyzer:
         with open(self.cache_file, 'rb') as f:
             return pickle.load(f)
 
-    def _save_cache(self, results_map, monthly_reg_res, mmm_res):
+    def _save_cache(self, results_map, seasonal_reg_res, mmm_res):
         """保存计算结果到缓存"""
         with open(self.cache_file, 'wb') as f:
             pickle.dump({
                 'results_map': results_map,
-                'monthly_reg_res': monthly_reg_res,
+                'seasonal_reg_res': seasonal_reg_res,
                 'mmm_res': mmm_res,
             }, f)
         logger.info(f"已保存缓存: {self.cache_file}")
@@ -518,10 +562,10 @@ class SeasonalSchemeErrorAnalyzer:
             cache = self._load_cache()
             for metric, title in [('rmse', 'RMSE'), ('mae', 'MAE'), ('bias', 'Bias')]:
                 self.plot_seasonal_spatial_maps(cache['results_map'], metric, title)
-                self.plot_monthly_timeseries(cache['monthly_reg_res'], cache['mmm_res'], metric, title)
+                self.plot_seasonal_regional_boxplot(cache['seasonal_reg_res'], cache['mmm_res'], metric, title)
             return
 
-        logger.info("开始计算空间分布数据...")
+        logger.info("开始计算空间分布数据 (四季)...")
         results_map = {}
         seasons = ['DJF', 'MAM', 'JJA', 'SON']
         tasks_spatial = [(model, scheme, season) for scheme in SCHEMES for season in seasons for model in models]
@@ -530,21 +574,22 @@ class SeasonalSchemeErrorAnalyzer:
             for future in as_completed({executor.submit(self._process_spatial_task, *t): t for t in tasks_spatial}):
                 if future.result(): results_map[(future.result()[1], future.result()[2], future.result()[0])] = future.result()[3]
         
-        logger.info("开始计算月度区域数据...")
-        monthly_reg_res = {s: {} for s in SCHEMES}
-        tasks_monthly = [(model, scheme) for model in models for scheme in SCHEMES]
-        with ProcessPoolExecutor(max_workers=min(n_jobs or 16, len(tasks_monthly))) as executor:
-            for future in as_completed({executor.submit(self._process_monthly_task, *t): t for t in tasks_monthly}):
-                if future.result(): monthly_reg_res[future.result()[1]][future.result()[0]] = future.result()[2]
+        logger.info("开始计算季节区域指标时间序列数据...")
+        seasonal_reg_res = {s: {} for s in SCHEMES}
+        tasks_regional = [(model, scheme) for model in models for scheme in SCHEMES]
+        with ProcessPoolExecutor(max_workers=min(n_jobs or 16, len(tasks_regional))) as executor:
+            for future in as_completed({executor.submit(self._process_seasonal_regional_task, *t): t for t in tasks_regional}):
+                res = future.result()
+                if res: seasonal_reg_res[res[1]][res[0]] = res[2]
         
-        logger.info("计算 MMM...")
-        mmm_res = {s: self.calculate_mmm_monthly_metrics(s) for s in SCHEMES}
+        logger.info("计算 Multi-Model Mean (MMM) 季节区域指标...")
+        mmm_res = {s: self.calculate_mmm_seasonal_metrics(s) for s in SCHEMES}
         
-        self._save_cache(results_map, monthly_reg_res, mmm_res)
+        self._save_cache(results_map, seasonal_reg_res, mmm_res)
         
         for metric, title in [('rmse', 'RMSE'), ('mae', 'MAE'), ('bias', 'Bias')]:
             self.plot_seasonal_spatial_maps(results_map, metric, title)
-            self.plot_monthly_timeseries(monthly_reg_res, mmm_res, metric, title)
+            self.plot_seasonal_regional_boxplot(seasonal_reg_res, mmm_res, metric, title)
 
 def main():
     parser = create_parser(description="季节预报方案误差分析", var_default=None, var_required=False)

@@ -63,6 +63,32 @@ class DataLoader:
             }
         }
 
+    def _select_by_dynamic_leadtime(self, da: xr.DataArray, init_year: int, init_month: int, target_leadtime: int) -> Optional[xr.DataArray]:
+        """
+        核心更新：通过 time 维度灵活获取 year+month 信息，动态计算并匹配 leadtime，彻底消除硬编码索引。
+        """
+        if 'time' not in da.dims:
+            return None
+            
+        init_time = pd.Timestamp(init_year, init_month, 1)
+        try:
+            # 提取真实的目标时间 (Valid Time)
+            valid_times = pd.DatetimeIndex(da.time.values)
+        except Exception as e:
+            logger.warning(f"时间维度解析失败: {e}")
+            return None
+            
+        # 动态计算每个时间点对应的真实 leadtime (以月为单位)
+        calc_leads = (valid_times.year - init_time.year) * 12 + (valid_times.month - init_time.month)
+        
+        # 匹配目标 leadtime 的索引位置
+        match_indices = np.where(calc_leads == target_leadtime)[0]
+        if len(match_indices) == 0:
+            return None
+            
+        # 返回精确匹配的那一个时间切片
+        return da.isel(time=match_indices[0])
+
     def get_model_suffix(self, model_name: str) -> str:
         """
         根据模式名称推断pressure-level文件后缀。
@@ -138,9 +164,10 @@ class DataLoader:
                             da = da.sel(level=pressure_level).drop_vars('level', errors='ignore')
 
                             if 'time' in da.dims and 'number' in da.dims:
-                                if da.time.size <= leadtime:
-                                    continue
-                                da = da.isel(time=leadtime)
+                                # 使用动态计算替代硬编码 isel
+                                da_selected = self._select_by_dynamic_leadtime(da, year, month, leadtime)
+                                if da_selected is None: continue
+                                da = da_selected
                             elif 'time' in da.dims:
                                 init = pd.Timestamp(year, month, 1)
                                 da = da.sel(time=init, method='nearest', tolerance='15D')
@@ -226,9 +253,11 @@ class DataLoader:
                             da = da.drop_vars('level', errors='ignore')
 
                         if 'time' in da.dims:
-                            if da.time.size <= leadtime:
-                                continue
-                            da = da.isel(time=leadtime)
+                            # 使用动态计算替代硬编码 isel
+                            da_selected = self._select_by_dynamic_leadtime(da, year, month, leadtime)
+                            if da_selected is None: continue
+                            da = da_selected
+                            
                         if 'number' not in da.dims:
                             da = da.expand_dims('number')
 
@@ -362,15 +391,14 @@ class DataLoader:
                         
                         # 处理预报时效
                         if 'number' in da.dims and 'time' in da.dims:
-                            # 模型数据的时间维度是预报时效
-                            if da.time.size <= leadtime:
-                                continue
-                            da = da.isel(time=leadtime)
+                            # 使用动态计算替代硬编码 isel
+                            da_selected = self._select_by_dynamic_leadtime(da, year, month, leadtime)
+                            if da_selected is None: continue
+                            da = da_selected
+                            
                             if 'number' in da.dims:
                                 da = da.mean(dim='number')
                         elif 'time' in da.dims:
-                            # 修复：其他数据的时间维度处理
-                            # 使用初始化时间而不是有效时间
                             init = pd.Timestamp(year, month, 1)
                             if init.year < 1993 or init.year > 2020:
                                 continue
@@ -384,7 +412,7 @@ class DataLoader:
                             da = da * config['fcst_conv'](1)
                             da = da.clip(min=0).fillna(0)
                         
-                        # 空间处理 - 选择目标区域（不进行重采样，保持原始网格）
+                        # 空间处理 - 选择目标区域
                         da = self.dynamic_coord_sel(da, {'lat': (15, 55), 'lon': (70, 140)})
                         
                         # 保存第一个数据的坐标信息（用于后续构建DataArray）
@@ -392,7 +420,7 @@ class DataLoader:
                             actual_lat = da.lat.values.copy()
                             actual_lon = da.lon.values.copy()
                         
-                        # 获取数据数组（保持原始网格分辨率）
+                        # 获取数据数组
                         arr = da.values
                         if arr.ndim == 3:
                             arr = arr[0]
@@ -400,7 +428,6 @@ class DataLoader:
                             continue
                         
                         all_monthly_data.append(arr)
-                        # 使用实际的预报时间（从文件内time坐标获取）
                         forecast_time = pd.Timestamp(da.time.values) if hasattr(da, 'time') else pd.Timestamp(year, month, 1)
                         all_monthly_times.append(forecast_time)
                 
@@ -429,10 +456,9 @@ class DataLoader:
                     logger.warning(f"数据网格不一致: 第一个 {first_arr.shape}, 当前 {arr.shape}")
             
             # 检查时间戳是否有重复并去重
-            unique_times = list(dict.fromkeys(all_monthly_times))  # 保持顺序的去重
+            unique_times = list(dict.fromkeys(all_monthly_times))
             if len(unique_times) != len(all_monthly_times):
                 logger.warning(f"发现重复时间戳，原始长度: {len(all_monthly_times)}, 去重后: {len(unique_times)}")
-                # 去重数据
                 unique_data = []
                 seen_times = set()
                 for i, time in enumerate(all_monthly_times):
@@ -452,7 +478,7 @@ class DataLoader:
             data = data.sortby('time')
             
             # 检查最终数据的时间长度
-            if len(data.time) > 400:  # 超过400个月（约33年）可能有问题
+            if len(data.time) > 400:
                 logger.warning(f"数据时间长度异常: {len(data.time)} 个月，模型: {model}, 预报时效: {leadtime}")
                 logger.warning(f"时间范围: {data.time.min().values} 到 {data.time.max().values}")
             
