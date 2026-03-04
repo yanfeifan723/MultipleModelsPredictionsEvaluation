@@ -8,6 +8,7 @@
 1. 增加 Ensemble Member 维度的 ACC 计算。
 2. 绘图增加所有模式所有成员的 Spread 阴影。
 3. 保存时增加 member 维度的变量。
+4. 新增按 LeadTime 分图、Month 为横轴的区域 ACC 绘图功能。
 """
 
 import sys
@@ -184,9 +185,6 @@ class SeasonalMonthlyPearsonAnalyzer:
             obs_anom = obs_data.groupby('time.month') - obs_clim
             
             # 模式的气候态
-            # 如果 fcst_data 有 'number' 维度，groupby('time.month').mean('time') 会对每个 member 计算气候态
-            # 这里的做法是：每个 member 减去该 member 自己的气候态 (或者 ensemble mean 的气候态)。
-            # 通常 ACC 计算中，每个 member 减去其自身的气候态是比较标准的做法。
             fcst_clim = fcst_data.groupby('time.month').mean('time')
             fcst_anom = fcst_data.groupby('time.month') - fcst_clim
             
@@ -608,6 +606,9 @@ class SeasonalMonthlyPearsonAnalyzer:
         self.plot_acc_spatial_maps(model_temporal_acc_maps)
         self.plot_regional_index_acc_leadtime_timeseries(region_spatial_acc_data)
         
+        # === 新增调用：按 Leadtime 分别绘制月度 ACC 曲线 ===
+        self.plot_regional_index_acc_monthly_series_by_leadtime(region_spatial_acc_data)
+        
         return results
 
     def plot_acc_spatial_maps(self, model_temporal_acc_maps: Dict[str, Dict[int, xr.Dataset]]):
@@ -924,6 +925,150 @@ class SeasonalMonthlyPearsonAnalyzer:
         except Exception as e:
             logger.error(f"分区域折线图绘制失败: {e}")
 
+    def plot_regional_index_acc_monthly_series_by_leadtime(self, region_spatial_acc_data: Dict):
+        """
+        绘制分区域的 Index ACC 随 Month 变化的折线图 (按 Lead Time 分图)
+        逻辑：
+        1. 遍历所有 Lead Time，每个 Lead Time 生成一张独立的 PNG 图片。
+        2. 图片内为 3x3 子图，对应 9 个区域。
+        3. 子图 X 轴为 Month (1-12)，Y 轴为 ACC。
+        4. 包含所有 Member 的 Spread (阴影) 和 Ensemble Mean (实线)。
+        """
+        try:
+            region_order = [
+                'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
+                'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
+                'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+            ]
+            regions = [r for r in region_order if r in region_spatial_acc_data]
+            if not regions: return
+
+            # 1. 获取所有可用的 Leadtimes (通过检查第一个区域的第一个模型数据)
+            all_leadtimes = set()
+            for r in regions:
+                for m in MODELS:
+                    if m in region_spatial_acc_data[r] and region_spatial_acc_data[r][m]:
+                        # 快速读取一个样本来确定 leadtimes
+                        sample_ds = xr.concat(region_spatial_acc_data[r][m], dim='leadtime')
+                        all_leadtimes.update([int(lt) for lt in sample_ds.leadtime.values])
+                        break
+                if all_leadtimes: break
+            sorted_lts = sorted(list(all_leadtimes))
+
+            cmap = plt.get_cmap('tab10')
+            months = np.arange(1, 13)
+            month_labels = ['J', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D']
+
+            # 2. 外层循环：遍历 Lead Time
+            for lt in sorted_lts:
+                # 每个 Leadtime 创建一个新画布
+                fig = plt.figure(figsize=(18, 15))
+                n_cols = 3; n_rows = 3
+                
+                # 预设子图位置
+                subplot_positions = {
+                    'Z1-Northwest': (0, 0), 'Z2-InnerMongolia': (0, 1), 'Z3-Northeast': (0, 2),
+                    'Z4-Tibetan': (1, 0), 'Z5-NorthChina': (1, 1), 'Z6-Yangtze': (1, 2),
+                    'Z7-Southwest': (2, 0), 'Z8-SouthChina': (2, 1), 'Z9-SouthSea': (2, 2)
+                }
+                axes_dict = {}
+
+                # 初始化子图
+                for reg_name in regions:
+                    if reg_name in subplot_positions:
+                        row, col = subplot_positions[reg_name]
+                        ax = plt.subplot(n_rows, n_cols, row * n_cols + col + 1)
+                        axes_dict[reg_name] = ax
+
+                # 3. 内层循环：遍历区域进行绘图
+                for reg_name in regions:
+                    if reg_name not in axes_dict: continue
+                    ax = axes_dict[reg_name]
+                    model_data = region_spatial_acc_data[reg_name]
+
+                    # --- A. 计算 Spread (该 Leadtime 下，所有模型所有成员在每个月的分布) ---
+                    # 结构: month_idx -> list of acc values
+                    spread_vals = {m: [] for m in months} 
+                    
+                    for model in MODELS:
+                        if model not in model_data or not model_data[model]: continue
+                        # 合并该模型的时间维数据
+                        combined_ds = xr.concat(model_data[model], dim='leadtime').sortby('leadtime')
+                        
+                        # 提取特定 Leadtime 的数据
+                        if lt not in combined_ds.leadtime.values: continue
+                        ds_lt = combined_ds.sel(leadtime=lt)
+                        
+                        if 'regional_index_acc_members' in ds_lt:
+                            mem_data = ds_lt['regional_index_acc_members'].values
+                            # 确保是二维 (number, month)
+                            if mem_data.ndim == 2:
+                                for m_idx, m in enumerate(months):
+                                    vals = mem_data[:, m_idx]
+                                    vals = vals[np.isfinite(vals)]
+                                    spread_vals[m].extend(vals)
+
+                    # 计算 Spread 的上下界
+                    y_min = []; y_max = []
+                    valid_spread = False
+                    for m in months:
+                        vals = spread_vals[m]
+                        if vals:
+                            y_min.append(np.min(vals))
+                            y_max.append(np.max(vals))
+                            valid_spread = True
+                        else:
+                            y_min.append(np.nan)
+                            y_max.append(np.nan)
+                    
+                    if valid_spread:
+                        ax.fill_between(months, y_min, y_max, color='gray', alpha=0.2, 
+                                      label='Multi-model Member Spread' if reg_name == regions[0] else "")
+
+                    # --- B. 绘制 Ensemble Mean ---
+                    for mi, model in enumerate(MODELS):
+                        if model not in model_data or not model_data[model]: continue
+                        combined_ds = xr.concat(model_data[model], dim='leadtime').sortby('leadtime')
+                        if lt not in combined_ds.leadtime.values: continue
+                        
+                        ds_lt = combined_ds.sel(leadtime=lt)
+                        # 数据形状: (month,)
+                        mean_data = ds_lt['regional_index_acc'].values
+                        
+                        if len(mean_data) == 12:
+                            ax.plot(months, mean_data, marker='o', linewidth=2, markersize=4,
+                                   label=model.replace('-mon', '').replace('mon-', '') if reg_name == regions[0] else "",
+                                   color=cmap(mi % cmap.N))
+
+                    ax.set_title(f"{reg_name}", fontsize=14, fontweight='bold')
+                    ax.grid(True, linestyle=':', alpha=0.6)
+                    ax.set_xticks(months)
+                    ax.set_xticklabels(month_labels)
+                    if reg_name in ['Z7-Southwest', 'Z8-SouthChina', 'Z9-SouthSea']:
+                        ax.set_xlabel('Month', fontsize=12)
+                    if reg_name in ['Z1-Northwest', 'Z4-Tibetan', 'Z7-Southwest']:
+                        ax.set_ylabel(f'ACC (Lead {lt})', fontsize=12)
+
+                # 添加图例
+                handles, labels = axes_dict[regions[0]].get_legend_handles_labels()
+                by_label = dict(zip(labels, handles))
+                if by_label:
+                    fig.legend(by_label.values(), by_label.keys(), loc='lower center', 
+                             bbox_to_anchor=(0.5, 0.02), ncol=4, fontsize=14, frameon=False)
+
+                plt.subplots_adjust(top=0.95, bottom=0.12, hspace=0.3, wspace=0.2)
+                
+                # 保存文件，文件名包含 Leadtime
+                out_path = self.plot_dir / f"regional_index_acc_monthly_L{lt}_{self.var_type}.png"
+                plt.savefig(out_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.info(f"已保存 Leadtime {lt} 的月度ACC分布图: {out_path}")
+
+        except Exception as e:
+            logger.error(f"按Leadtime绘制月度ACC失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
     def load_spatial_acc_from_nc(self, models: List[str]) -> Dict[str, List[xr.Dataset]]:
         # ... (保持不变)
         model_spatial_acc_data = {model: [] for model in models}
@@ -970,6 +1115,8 @@ class SeasonalMonthlyPearsonAnalyzer:
                 self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
                 self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
                 self.plot_regional_index_acc_leadtime_timeseries(region_spatial_acc_data)
+                # === 新增调用：Plot-only 模式下也绘图 ===
+                self.plot_regional_index_acc_monthly_series_by_leadtime(region_spatial_acc_data)
             
             self.plot_acc_spatial_maps(model_temporal_acc_maps)
             return None
@@ -1023,10 +1170,11 @@ class SeasonalMonthlyPearsonAnalyzer:
             self.save_temporal_acc_maps_to_nc(model_temporal_acc_maps)
             self.save_region_index_acc_to_nc(region_spatial_acc_data)
             
-            self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
-            self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
+            # self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
+            # self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
             self.plot_acc_spatial_maps(model_temporal_acc_maps)
-            self.plot_regional_index_acc_leadtime_timeseries(region_spatial_acc_data)
+            # self.plot_regional_index_acc_leadtime_timeseries(region_spatial_acc_data)
+            self.plot_regional_index_acc_monthly_series_by_leadtime(region_spatial_acc_data)
 
         self.save_data_to_csv(results)
         return results
