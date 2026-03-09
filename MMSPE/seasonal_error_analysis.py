@@ -10,10 +10,7 @@
 5. 将可视化图表从箱线图升级为 小提琴图 (Violin Plot + Scatter)，更清晰地展示成员分布的密度。
 6. 区域数据计算升级为：先空间拼接成季节场，求面积加权区域平均，最后沿“年份(Year)”计算季节误差指标。
 7. 统一纵坐标轴：自动计算全局极值，所有子图纵轴范围完全一致，并保留一位小数格式化。
-
-定义：
-- Short-term (L0-2): 使用起报当月(L0)、+1月(L1)、+2月(L2)的数据合成目标季节。
-- Long-term (L3-5): 使用起报+3月(L3)、+4月(L4)、+5月(L5)的数据合成目标季节。
+8. [更新] 小提琴图使用 inner='quartile' 绘制中位数和四分位数横线。
 """
 
 import sys
@@ -517,10 +514,9 @@ class SeasonalSchemeErrorAnalyzer:
                     spread_labels.extend([season] * len(season_mems))
                 
                 if spread_data:
-                    # 使用小提琴图替代箱线图
-                    # inner=None 取消内部箱线图，cut=0 限制 KDE 不超出真实数据范围 (防止负 RMSE)
+                    # 使用小提琴图，inner='quartile' 会绘制中位数和上下四分位数的横线
                     sns.violinplot(x=spread_labels, y=spread_data, ax=ax, 
-                                   color='lightgray', inner=None, linewidth=1, 
+                                   color='lightgray', inner='quartile', linewidth=1, 
                                    cut=0, zorder=1)
                 
                 if metric == 'bias':

@@ -8,6 +8,8 @@
 3. 将月度折线图替换为以季节为横轴的小提琴散点图 (Violin Plot + Scatter)，全面展示成员密度分布 (Spread)、单模式和MMM。
 4. 区域数据计算升级为：先空间拼接成季节场，求面积加权区域平均，最后沿“年份(Year)”计算季节ACC。
 5. 新增统一纵坐标轴：自动计算全局极值，所有子图纵轴范围完全一致，并保留一位小数格式化。
+6. 区域平均分析中保留显著性 P 值，以便下游 heatmap 打点使用。
+7. [更新] 小提琴图使用 inner='quartile' 绘制中位数和四分位数横线。
 """
 
 import sys
@@ -248,7 +250,12 @@ class SeasonalSchemePearsonAnalyzerV3:
                 fcst_ts = fcst_reg.weighted(w_reg).mean(['lat', 'lon'], skipna=True)
                 
                 mask = np.isfinite(obs_ts) & np.isfinite(fcst_ts)
-                r_mean = stats.pearsonr(obs_ts[mask], fcst_ts[mask])[0] if mask.sum() > 3 else np.nan
+                
+                # 保留 p_value
+                if mask.sum() > 3:
+                    r_mean, p_mean = stats.pearsonr(obs_ts[mask], fcst_ts[mask])
+                else:
+                    r_mean, p_mean = np.nan, np.nan
                 
                 mem_rs = []
                 if fcst_mem_reg is not None:
@@ -258,7 +265,7 @@ class SeasonalSchemePearsonAnalyzerV3:
                         m_mask = np.isfinite(obs_ts) & np.isfinite(mts)
                         if m_mask.sum() > 3: mem_rs.append(stats.pearsonr(obs_ts[m_mask], mts[m_mask])[0])
                 
-                results[reg_name][season] = {'acc': r_mean, 'members': mem_rs}
+                results[reg_name][season] = {'acc': r_mean, 'p_value': p_mean, 'members': mem_rs}
         return results
 
     def calculate_mmm_seasonal_acc(self, scheme: str):
@@ -300,8 +307,13 @@ class SeasonalSchemePearsonAnalyzerV3:
                 f_ts = f_r.weighted(w_r).mean(['lat', 'lon'], skipna=True)
                 
                 mask = np.isfinite(o_ts) & np.isfinite(f_ts)
-                if mask.sum() > 3: results[reg][season] = stats.pearsonr(o_ts[mask], f_ts[mask])[0]
-                else: results[reg][season] = np.nan
+                
+                # 保留 p_value
+                if mask.sum() > 3: 
+                    r_val, p_val = stats.pearsonr(o_ts[mask], f_ts[mask])
+                    results[reg][season] = {'acc': r_val, 'p_value': p_val}
+                else: 
+                    results[reg][season] = {'acc': np.nan, 'p_value': np.nan}
                 
         return results
 
@@ -457,8 +469,10 @@ class SeasonalSchemePearsonAnalyzerV3:
                             global_min = min(global_min, val)
                             global_max = max(global_max, val)
                     
-                    # 搜集 MMM 的最值
-                    mmm_val = mmm_seasonal_res[scheme].get(reg, {}).get(season, np.nan)
+                    # 搜集 MMM 的最值 (兼容新旧格式)
+                    mmm_res_entry = mmm_seasonal_res[scheme].get(reg, {}).get(season, {})
+                    mmm_val = mmm_res_entry.get('acc', np.nan) if isinstance(mmm_res_entry, dict) else mmm_res_entry
+                    
                     if np.isfinite(mmm_val):
                         global_min = min(global_min, mmm_val)
                         global_max = max(global_max, mmm_val)
@@ -498,9 +512,9 @@ class SeasonalSchemePearsonAnalyzerV3:
                     spread_labels.extend([season] * len(season_mems))
                 
                 if spread_data:
-                    # 使用小提琴图，去除内部箱线图 (inner=None)，防止KDE超界 (cut=0)
+                    # 使用小提琴图，inner='quartile' 会绘制中位数和上下四分位数的横线
                     sns.violinplot(x=spread_labels, y=spread_data, ax=ax, 
-                                   color='lightgray', inner=None, linewidth=1, 
+                                   color='lightgray', inner='quartile', linewidth=1, 
                                    cut=0, zorder=1)
 
                 ax.axhline(0, color='black', linewidth=1.0, linestyle='--', zorder=0)
@@ -520,7 +534,11 @@ class SeasonalSchemePearsonAnalyzerV3:
                                label=display_name if i == 0 else "", zorder=3)
 
                 # 3. 绘制 Multi-Model Mean (MMM) 的黑色大星星
-                mmm_vals = [mmm_seasonal_res[scheme].get(reg, {}).get(season, np.nan) for season in seasons]
+                mmm_vals = []
+                for season in seasons:
+                    m_res = mmm_seasonal_res[scheme].get(reg, {}).get(season, {})
+                    mmm_vals.append(m_res.get('acc', np.nan) if isinstance(m_res, dict) else m_res)
+                    
                 ax.scatter(np.arange(len(seasons)), mmm_vals, color='black', marker='*', 
                            s=250, edgecolors='white', linewidth=1, 
                            label='MMM' if i == 0 else "", zorder=4)

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多区域三重指标(Bias, RMSE, ACC)组合热图绘制模块 (Fixed V10 - Robust Reading)
+多区域三重指标(Bias, RMSE, ACC)组合热图绘制模块
 功能升级：
 1. 增强数据读取鲁棒性：自动处理标量、0维数组或单维度数组。
 2. 同步适配 Ensemble Member 更新：显式读取 Ensemble Mean 变量，确保与新文件结构兼容。
-3. 保持特性：无 MAE，ECCC 别名，显著性打点。
+3. 接入 MMSPE 季节分析方案数据：使用 Short-term 替代 L0-2 的 seasonal 结果，Long-term 替代 L3-5 的 seasonal 结果，提升季节评估的物理意义。
+4. [更新] 支持加载 MMSPE 模块新保存的 seasonal_p 显著性检验结果，并在热图上正确打点。
 """
 
 import sys
 import os
+import pickle
 from pathlib import Path
 import logging
 import numpy as np
@@ -57,43 +59,60 @@ class RegionalHeatMapPlotter:
         self.error_base_dir = Path(f"/sas12t1/ffyan/output/error_analysis/region_metrics/{var_type}")
         self.output_dir = Path(f"/sas12t1/ffyan/output/heat_map_regional/{var_type}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 加载 MMSPE 缓存以替换 seasonal 数据
+        self.mmspe_err_cache = Path(f"/sas12t1/ffyan/output/seasonal_scheme_error_analysis/cache/{var_type}_error_data_cache.pkl")
+        self.mmspe_acc_cache = Path(f"/sas12t1/ffyan/output/seasonal_scheme_analysis/cache/{var_type}.pkl")
+
+        self.mmspe_seasonal_err = None
+        self.mmspe_seasonal_acc = None
+        
+        if self.mmspe_err_cache.exists():
+            try:
+                with open(self.mmspe_err_cache, 'rb') as f:
+                    self.mmspe_seasonal_err = pickle.load(f).get('seasonal_reg_res', {})
+                logger.info("已成功加载 MMSPE 误差季节分析缓存。")
+            except Exception as e:
+                logger.warning(f"加载 MMSPE 误差缓存失败: {e}")
+                
+        if self.mmspe_acc_cache.exists():
+            try:
+                with open(self.mmspe_acc_cache, 'rb') as f:
+                    self.mmspe_seasonal_acc = pickle.load(f).get('seasonal_reg_res', {})
+                logger.info("已成功加载 MMSPE ACC季节分析缓存。")
+            except Exception as e:
+                logger.warning(f"加载 MMSPE ACC缓存失败: {e}")
 
     def _safe_get_value(self, da, selector):
-        """
-        鲁棒的数据提取辅助函数
-        处理各种可能的维度情况：标量、0-d array、1-d array(size=1)
-        """
+        """鲁棒的数据提取辅助函数"""
         try:
             subset = da.sel(**selector)
-            # 处理空数据
             if subset.size == 0:
                 return np.nan
-            
             vals = subset.values
-            # 如果是标量或0-d数组
             if np.ndim(vals) == 0:
                 return float(vals.item())
-            
-            # 如果是数组，尝试 squeeze
             vals = np.squeeze(vals)
             if np.ndim(vals) == 0:
                 return float(vals.item())
-            
-            # 如果是 (number, ) 或类似数组，取均值（兜底策略）
             return float(np.nanmean(vals))
         except Exception:
             return np.nan
 
     def load_regional_data(self, region: str) -> Dict:
-        """加载数据 (Bias, RMSE, ACC) - 读取 Ensemble Mean"""
+        """加载数据 (Bias, RMSE, ACC) - 并集成 MMSPE 的 seasonal 结果"""
         data = {}
         safe_region = region.replace(' ', '_')
 
         for lt in LEADTIMES:
             data[lt] = {'bias': {}, 'rmse': {}, 'acc': {}}
+            # 根据 leadtime 选择对应的 scheme
+            scheme = 'Short-term' if int(lt) <= 2 else 'Long-term'
 
             for model in MODEL_LIST:
+                # ==========================
                 # 1. ACC
+                # ==========================
                 acc_file = self.acc_base_dir / f"region_index_acc_{safe_region}_{model}_{self.var_type}.nc"
                 acc_entry = {'monthly': {}, 'seasonal': {}, 'monthly_p': {}, 'seasonal_p': {}}
                 
@@ -103,11 +122,10 @@ class RegionalHeatMapPlotter:
                             if int(lt) in ds.leadtime.values:
                                 ds_lt = ds.sel(leadtime=int(lt))
                                 
-                                # --- Monthly ACC (Read standard variable which is Ens Mean) ---
+                                # --- Monthly ACC ---
                                 if 'regional_index_acc' in ds_lt:
                                     da_acc = ds_lt['regional_index_acc']
                                     da_p = ds_lt.get('p_value')
-                                    
                                     for m in range(1, 13):
                                         m_name = MONTHS[m-1]
                                         acc_entry['monthly'][m_name] = self._safe_get_value(da_acc, {'month': m})
@@ -115,12 +133,11 @@ class RegionalHeatMapPlotter:
                                             acc_entry['monthly_p'][m_name] = self._safe_get_value(da_p, {'month': m})
                                         else:
                                             acc_entry['monthly_p'][m_name] = np.nan
-                                
-                                # --- Seasonal ACC ---
+                                            
+                                # --- Seasonal ACC (回退方案) ---
                                 if 'regional_index_acc_seasonal' in ds_lt and 'season' in ds_lt.coords:
                                     da_acc_seas = ds_lt['regional_index_acc_seasonal']
                                     da_p_seas = ds_lt.get('p_value_seasonal')
-                                    
                                     for seas in SEASONS.keys():
                                         if seas in ds_lt.season.values:
                                             acc_entry['seasonal'][seas] = self._safe_get_value(da_acc_seas, {'season': seas})
@@ -132,18 +149,30 @@ class RegionalHeatMapPlotter:
                                             acc_entry['seasonal'][seas] = np.nan
                                             acc_entry['seasonal_p'][seas] = np.nan
                                 else:
-                                    # 回退逻辑
                                     for seas, m_idxs in SEASONS.items():
                                         vals = [acc_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
                                         acc_entry['seasonal'][seas] = float(np.nanmean(vals))
                                         acc_entry['seasonal_p'][seas] = np.nan 
-                                
-                                data[lt]['acc'][model] = acc_entry
                     except Exception as e:
-                        # logger.warning(f"Failed loading ACC for {model} {lt}: {e}")
                         pass
+                
+                # --- [重点] 使用 MMSPE 缓存替换 Seasonal ACC 和 p_value ---
+                if self.mmspe_seasonal_acc and scheme in self.mmspe_seasonal_acc:
+                    for seas in SEASONS.keys():
+                        season_data = self.mmspe_seasonal_acc[scheme].get(model, {}).get(region, {}).get(seas, {})
+                        val = season_data.get('acc', np.nan)
+                        p_val = season_data.get('p_value', np.nan)
+                        
+                        # 如果有有效值，则覆盖旧的数据
+                        if np.isfinite(val):
+                            acc_entry['seasonal'][seas] = val
+                            acc_entry['seasonal_p'][seas] = p_val
 
+                data[lt]['acc'][model] = acc_entry
+
+                # ==========================
                 # 2. Error Metrics (Bias, RMSE)
+                # ==========================
                 err_file = self.error_base_dir / f"{region}_{model}.nc"
                 bias_entry = {'monthly': {}, 'seasonal': {}}
                 rmse_entry = {'monthly': {}, 'seasonal': {}}
@@ -155,7 +184,6 @@ class RegionalHeatMapPlotter:
                                 ds_lt = ds.sel(leadtime=int(lt))
                                 
                                 def extract_metric(ds_subset, metric_prefix, target_entry):
-                                    # Monthly (Ens Mean)
                                     var_mon = f"{metric_prefix}_monthly"
                                     if var_mon in ds_subset:
                                         da = ds_subset[var_mon]
@@ -167,7 +195,6 @@ class RegionalHeatMapPlotter:
                                     else:
                                         for m in MONTHS: target_entry['monthly'][m] = np.nan
 
-                                    # Seasonal (Ens Mean)
                                     var_seas = f"{metric_prefix}_seasonal"
                                     if var_seas in ds_subset and 'season' in ds_subset.dims:
                                         da_seas = ds_subset[var_seas]
@@ -177,18 +204,26 @@ class RegionalHeatMapPlotter:
                                             else:
                                                 target_entry['seasonal'][s] = np.nan
                                     else:
-                                        # 回退逻辑
                                         for seas, m_idxs in SEASONS.items():
                                             vals = [target_entry['monthly'].get(MONTHS[m-1], np.nan) for m in m_idxs]
                                             target_entry['seasonal'][seas] = float(np.nanmean(vals))
 
                                 extract_metric(ds_lt, 'bias', bias_entry)
                                 extract_metric(ds_lt, 'rmse', rmse_entry)
-                                
-                                data[lt]['bias'][model] = bias_entry
-                                data[lt]['rmse'][model] = rmse_entry
                     except Exception as e:
                         pass
+                
+                # --- [重点] 使用 MMSPE 缓存替换 Seasonal Bias & RMSE ---
+                if self.mmspe_seasonal_err and scheme in self.mmspe_seasonal_err:
+                    for seas in SEASONS.keys():
+                        b_val = self.mmspe_seasonal_err[scheme].get(model, {}).get(region, {}).get(seas, {}).get('bias', np.nan)
+                        r_val = self.mmspe_seasonal_err[scheme].get(model, {}).get(region, {}).get(seas, {}).get('rmse', np.nan)
+                        if np.isfinite(b_val): bias_entry['seasonal'][seas] = b_val
+                        if np.isfinite(r_val): rmse_entry['seasonal'][seas] = r_val
+
+                data[lt]['bias'][model] = bias_entry
+                data[lt]['rmse'][model] = rmse_entry
+
         return data
 
     def _get_levels_and_cmap(self, all_vals, metric):
@@ -329,7 +364,7 @@ class RegionalHeatMapPlotter:
                 vals[met].extend(global_data[met][m].get('monthly', {}).values())
                 vals[met].extend(global_data[met][m].get('seasonal', {}).values())
         
-        # 仅使用 RMSE 数据
+        # 仅使用 RMSE 数据生成 cmap
         norm_rmse, cmap_rmse, levels_rmse = self._get_levels_and_cmap(vals['rmse'], 'rmse')
 
         configs = {}
@@ -395,7 +430,6 @@ class RegionalHeatMapPlotter:
                         vals[met].extend(reg_d[met][m].get('monthly', {}).values())
                         vals[met].extend(reg_d[met][m].get('seasonal', {}).values())
 
-        # 仅使用 RMSE 数据
         norm_rmse, cmap_rmse, levels_rmse = self._get_levels_and_cmap(vals['rmse'], 'rmse')
 
         configs = {}
@@ -404,7 +438,6 @@ class RegionalHeatMapPlotter:
         configs['rmse'] = (norm_rmse, cmap_rmse, levels_rmse)
 
         fig = plt.figure(figsize=(30, 22)) 
-        # 调整为 2行 x 3列
         outer_gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.05, wspace=0.05, height_ratios=[1, 0.45]) 
         
         metrics_order = ['bias', 'rmse', 'acc']
@@ -449,14 +482,12 @@ class RegionalHeatMapPlotter:
         for col, metric in enumerate(metrics_order):
             norm, cmap, levels = configs[metric]
             
-            # 重新计算 colorbar 位置 (3列)
             left = 0.125 + col * 0.27
             cax = fig.add_axes([left + 0.01, 0.04, 0.22, 0.010])
             
             extend = 'both' if metric in ['bias', 'acc'] else 'max'
             cb = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation='horizontal', extend=extend)
             
-            # 增大刻度字体
             cb.ax.tick_params(labelsize=16)
             cb.set_ticks(levels)
             if all(x.is_integer() for x in levels):
