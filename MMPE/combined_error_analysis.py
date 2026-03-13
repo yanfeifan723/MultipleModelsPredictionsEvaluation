@@ -63,6 +63,8 @@ def generate_regions():
     })
     return regions
 
+REGIONS = generate_regions()
+
 # 配置日志
 logger = setup_logging(
     log_file='combined_error_analysis.log',
