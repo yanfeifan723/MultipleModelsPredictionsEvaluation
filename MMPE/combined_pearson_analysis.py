@@ -482,7 +482,6 @@ class SeasonalMonthlyPearsonAnalyzer:
         return np.nan
 
     def add_china_map_details(self, ax, data, lon, lat, levels, cmap, draw_scs=True):
-        # ... (保持原有代码不变)
         bou_paths = [
             Path("/sas12t1/ffyan/boundaries/中国_省1.shp"),
             Path("/sas12t1/ffyan/boundaries/中国_省2.shp")
@@ -543,7 +542,6 @@ class SeasonalMonthlyPearsonAnalyzer:
                 logger.warning(f"南海子图绘制失败: {e}")
     
     def analyze_all_models_leadtimes(self, models: List[str] = None, leadtimes: List[int] = None) -> Dict:
-        # ... (保持原有逻辑，内部调用已更新的 load_and_preprocess_data)
         if models is None: models = MODELS
         if leadtimes is None: leadtimes = LEADTIMES
         
@@ -593,14 +591,11 @@ class SeasonalMonthlyPearsonAnalyzer:
         self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
         self.plot_acc_spatial_maps(model_temporal_acc_maps)
         self.plot_regional_index_acc_leadtime_timeseries(region_spatial_acc_data)
-        
-        # === 新增调用：按 Leadtime 分别绘制月度 ACC 曲线 ===
         self.plot_regional_index_acc_monthly_series_by_leadtime(region_spatial_acc_data)
         
         return results
 
     def plot_acc_spatial_maps(self, model_temporal_acc_maps: Dict[str, Dict[int, xr.Dataset]]):
-        # ... (保持不变)
         try:
             plot_models = list(model_temporal_acc_maps.keys())
             leadtimes = [0, 3]
@@ -637,7 +632,6 @@ class SeasonalMonthlyPearsonAnalyzer:
             logger.error(f"ACC空间分布图绘制失败: {e}")
 
     def _plot_single_map(self, fig, gs, row, col, model, leadtime, maps, levels, cmap, xticks, yticks, char_label):
-        # ... (保持不变)
         if leadtime not in maps[model]:
             ax = fig.add_subplot(gs[row, col]); ax.axis('off'); return
         acc_ds = maps[model][leadtime]
@@ -660,7 +654,6 @@ class SeasonalMonthlyPearsonAnalyzer:
         ax.text(0.02, 0.96, f"({char_label}) {display_name}", transform=ax.transAxes, fontsize=18, fontweight='bold', va='top')
 
     def plot_spatial_acc_heatmap_diverging_discrete(self, region_spatial_acc_data: Optional[Dict] = None):
-        # ... (保持不变)
         try:
             if region_spatial_acc_data is None or 'Global' not in region_spatial_acc_data: return
             global_data = region_spatial_acc_data['Global']
@@ -712,7 +705,6 @@ class SeasonalMonthlyPearsonAnalyzer:
             logger.error(f"离散型对称热图绘制失败: {e}")
 
     def save_temporal_acc_maps_to_nc(self, model_temporal_acc_maps: Dict[str, Dict[int, xr.Dataset]]):
-        # ... (保持不变)
         out_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/temporal_acc_maps/{self.var_type}")
         out_dir.mkdir(parents=True, exist_ok=True)
         for model, lt_to_map in model_temporal_acc_maps.items():
@@ -725,7 +717,6 @@ class SeasonalMonthlyPearsonAnalyzer:
                 logger.error(f"保存 Temporal ACC 空间分布失败 ({model}): {e}")
 
     def save_region_index_acc_to_nc(self, region_spatial_acc_data: Dict):
-        # ... (保持不变，因为 dataset 结构已经包含 members 变量)
         if not region_spatial_acc_data: return
         for region_name, model_data in region_spatial_acc_data.items():
             for model, acc_list in model_data.items():
@@ -739,7 +730,6 @@ class SeasonalMonthlyPearsonAnalyzer:
                     logger.warning(f"保存区域 Index ACC 失败 ({region_name} {model}): {e}")
 
     def load_region_index_acc_from_nc(self, models: List[str]) -> Dict:
-        # ... (保持不变)
         region_spatial_acc_data = {r: {m: [] for m in models} for r in REGIONS.keys()}
         for region_name in REGIONS.keys():
             safe_region = region_name.replace(' ', '_')
@@ -757,7 +747,6 @@ class SeasonalMonthlyPearsonAnalyzer:
         return region_spatial_acc_data
 
     def save_spatial_acc_to_nc(self, model_spatial_acc_data: Dict[str, List[xr.Dataset]]):
-        # ... (保持不变)
         for model, acc_list in model_spatial_acc_data.items():
             if not acc_list: continue
             try:
@@ -837,9 +826,9 @@ class SeasonalMonthlyPearsonAnalyzer:
         """绘制分区域的 Index ACC 随 Leadtime 变化的折线图 (增加 Spread)"""
         try:
             region_order = [
-                'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
-                'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
-                'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+                    'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
+                    'Z4-Tibetan',   'Z5-CentralChina',  'Z6-NorthChina',
+                    'Z7-Yangtze',   'Z8-Southwest',     'Z9-SouthChina'
             ]
             regions = [r for r in region_order if r in region_spatial_acc_data]
             if not regions: return
@@ -847,9 +836,9 @@ class SeasonalMonthlyPearsonAnalyzer:
             n_cols = 3; n_rows = 3
             fig = plt.figure(figsize=(18, 15))
             subplot_positions = {
-                'Z1-Northwest': (0, 0), 'Z2-InnerMongolia': (0, 1), 'Z3-Northeast': (0, 2),
-                'Z4-Tibetan': (1, 0), 'Z5-NorthChina': (1, 1), 'Z6-Yangtze': (1, 2),
-                'Z7-Southwest': (2, 0), 'Z8-SouthChina': (2, 1), 'Z9-SouthSea': (2, 2)
+                    'Z1-Northwest': (0,0), 'Z2-InnerMongolia': (0,1), 'Z3-Northeast': (0,2),
+                    'Z4-Tibetan': (1,0), 'Z5-CentralChina': (1,1), 'Z6-NorthChina': (1,2),
+                    'Z7-Yangtze': (2,0), 'Z8-Southwest': (2,1), 'Z9-SouthChina': (2,2)
             }
             cmap = plt.get_cmap('tab10')
             axes_dict = {}
@@ -924,9 +913,9 @@ class SeasonalMonthlyPearsonAnalyzer:
         """
         try:
             region_order = [
-                'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
-                'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
-                'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+                    'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
+                    'Z4-Tibetan',   'Z5-CentralChina',  'Z6-NorthChina',
+                    'Z7-Yangtze',   'Z8-Southwest',     'Z9-SouthChina'
             ]
             regions = [r for r in region_order if r in region_spatial_acc_data]
             if not regions: return
@@ -955,9 +944,9 @@ class SeasonalMonthlyPearsonAnalyzer:
                 
                 # 预设子图位置
                 subplot_positions = {
-                    'Z1-Northwest': (0, 0), 'Z2-InnerMongolia': (0, 1), 'Z3-Northeast': (0, 2),
-                    'Z4-Tibetan': (1, 0), 'Z5-NorthChina': (1, 1), 'Z6-Yangtze': (1, 2),
-                    'Z7-Southwest': (2, 0), 'Z8-SouthChina': (2, 1), 'Z9-SouthSea': (2, 2)
+                    'Z1-Northwest': (0,0), 'Z2-InnerMongolia': (0,1), 'Z3-Northeast': (0,2),
+                    'Z4-Tibetan': (1,0), 'Z5-CentralChina': (1,1), 'Z6-NorthChina': (1,2),
+                    'Z7-Yangtze': (2,0), 'Z8-Southwest': (2,1), 'Z9-SouthChina': (2,2)
                 }
                 axes_dict = {}
 
@@ -1058,7 +1047,6 @@ class SeasonalMonthlyPearsonAnalyzer:
             logger.debug(traceback.format_exc())
 
     def load_spatial_acc_from_nc(self, models: List[str]) -> Dict[str, List[xr.Dataset]]:
-        # ... (保持不变)
         model_spatial_acc_data = {model: [] for model in models}
         for model in models:
             save_path = self.spatial_acc_dir / f"spatial_acc_timeseries_{model}_{self.var_type}.nc"
@@ -1073,7 +1061,6 @@ class SeasonalMonthlyPearsonAnalyzer:
         return model_spatial_acc_data
     
     def load_temporal_acc_maps_from_nc(self, models: List[str]) -> Dict[str, Dict[int, xr.Dataset]]:
-        # ... (保持不变)
         model_temporal_acc_maps = {model: {} for model in models}
         out_dir = Path(f"/sas12t1/ffyan/output/pearson_analysis/temporal_acc_maps/{self.var_type}")
         for model in models:
@@ -1103,7 +1090,6 @@ class SeasonalMonthlyPearsonAnalyzer:
                 self.plot_spatial_acc_heatmap_diverging_discrete(region_spatial_acc_data)
                 self.plot_spatial_acc_leadtime_timeseries(region_spatial_acc_data)
                 self.plot_regional_index_acc_leadtime_timeseries(region_spatial_acc_data)
-                # === 新增调用：Plot-only 模式下也绘图 ===
                 self.plot_regional_index_acc_monthly_series_by_leadtime(region_spatial_acc_data)
             
             self.plot_acc_spatial_maps(model_temporal_acc_maps)

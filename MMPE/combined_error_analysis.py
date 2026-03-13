@@ -481,8 +481,8 @@ class MultiModelErrorAnalyzer:
                 else:
                     region_order = [
                         'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
-                        'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
-                        'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+                        'Z4-Tibetan',   'Z5-CentralChina',  'Z6-NorthChina',
+                        'Z7-Yangtze',   'Z8-Southwest',     'Z9-SouthChina'
                     ]
                     regions = [r for r in region_order if r in region_metric_data]
                     if not regions: continue
@@ -491,8 +491,8 @@ class MultiModelErrorAnalyzer:
                     axes = {}
                     subplot_map = {
                         'Z1-Northwest': (0,0), 'Z2-InnerMongolia': (0,1), 'Z3-Northeast': (0,2),
-                        'Z4-Tibetan': (1,0), 'Z5-NorthChina': (1,1), 'Z6-Yangtze': (1,2),
-                        'Z7-Southwest': (2,0), 'Z8-SouthChina': (2,1), 'Z9-SouthSea': (2,2)
+                        'Z4-Tibetan': (1,0), 'Z5-CentralChina': (1,1), 'Z6-NorthChina': (1,2),
+                        'Z7-Yangtze': (2,0), 'Z8-Southwest': (2,1), 'Z9-SouthChina': (2,2)
                     }
                     for r in regions:
                         row, col = subplot_map[r]

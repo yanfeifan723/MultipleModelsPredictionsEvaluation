@@ -444,9 +444,9 @@ class RegionalHeatMapPlotter:
         titles = {'bias': 'Bias', 'rmse': 'RMSE', 'acc': 'ACC'}
         
         region_grid = [
-            ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast'],
-            ['Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze'],
-            ['Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea']
+            ['Z1-Northwest',    'Z2-InnerMongolia', 'Z3-Northeast'],
+            ['Z4-Tibetan',  'Z5-CentralChina',  'Z6-NorthChina'],
+            ['Z7-Yangtze', 'Z8-Southwest', 'Z9-SouthChina']
         ]
 
         for col, metric in enumerate(metrics_order):
