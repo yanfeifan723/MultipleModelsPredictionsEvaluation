@@ -39,8 +39,8 @@ except ImportError:
 REGION_GLOBAL = 'Global'
 REGIONS_Z = [
     'Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
-    'Z4-Tibetan',   'Z5-NorthChina',    'Z6-Yangtze',
-    'Z7-Southwest', 'Z8-SouthChina',    'Z9-SouthSea'
+    'Z4-Tibetan',   'Z5-CentralChina',  'Z6-NorthChina',
+    'Z7-Yangtze',   'Z8-Southwest',     'Z9-SouthChina'
 ]
 
 MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']

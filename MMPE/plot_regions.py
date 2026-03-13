@@ -23,17 +23,17 @@ from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 定义区域 (来自 combined_error_analysis.py 和 combined_pearson_analysis.py)
+# 定义区域
 REGIONS = {
-    'Z1-Northwest':     {'lat': (39, 49), 'lon': (73, 105)},   # 西北干旱区
-    'Z2-InnerMongolia': {'lat': (39, 50), 'lon': (106, 118)},  # 内蒙半干旱区
-    'Z3-Northeast':     {'lat': (40, 54), 'lon': (119, 135)},  # 东北湿润区
-    'Z4-Tibetan':       {'lat': (27, 39), 'lon': (73, 95)},    # 青藏高寒区
-    'Z5-NorthChina':    {'lat': (34, 39), 'lon': (106, 122)},  # 黄土-华北区
-    'Z6-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},  # 长江中下游区
-    'Z7-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},   # 四川-西南区
-    'Z8-SouthChina':    {'lat': (21, 25), 'lon': (106, 120)},  # 华南湿润区
-    'Z9-SouthSea':      {'lat': (18, 21), 'lon': (105, 125)}   # 南海热带区
+    'Z1-Northwest':     {'lat': (36, 50), 'lon': (73, 95)},   # 西北干旱区
+    'Z2-InnerMongolia': {'lat': (39, 45), 'lon': (95, 117)},  # 内蒙半干旱区
+    'Z3-Northeast':     {'lat': (40, 54), 'lon': (117, 135)},  # 东北湿润区
+    'Z4-Tibetan':       {'lat': (26, 37), 'lon': (77, 96)},    # 青藏高寒区
+    'Z5-CentralChina':  {'lat': (33, 40), 'lon': (96, 113)},    #华中
+    'Z6-NorthChina':    {'lat': (34, 40), 'lon': (113, 123)},  # 华北区
+    'Z7-Yangtze':       {'lat': (26, 34), 'lon': (108, 123)},  # 长江中下游区
+    'Z8-Southwest':     {'lat': (22, 33), 'lon': (96, 108)},   # 四川-西南区
+    'Z9-SouthChina':    {'lat': (18, 27), 'lon': (106, 125)}  # 华南湿润区
 }
 
 def load_geometries(ax, sub_ax=None):

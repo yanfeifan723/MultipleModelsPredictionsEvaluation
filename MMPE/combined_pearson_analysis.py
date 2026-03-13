@@ -112,31 +112,19 @@ MODELS = MODEL_LIST
 MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-# === 定义区域（Global + 9个规则气候区划） ===
 def generate_regions():
-    """
-    生成分析区域：Global（全域）+ 9个规则气候区划
-    基于方案二：中国气候9大规则区划
-    """
-    regions = {'Global': None}  # None 表示使用全域
-
-    # 定义9个区域的经纬度范围 (lat: min-max, lon: min-max)
-    # 依据方案二：中国气候 9 大规则区划
+    regions = {'Global': None}
     regions.update({
-        # --- 北部行 ---
-        'Z1-Northwest':     {'lat': (39, 49), 'lon': (73, 105)},   # 西北干旱区
-        'Z2-InnerMongolia': {'lat': (39, 50), 'lon': (106, 118)},  # 内蒙半干旱区
-        'Z3-Northeast':     {'lat': (40, 54), 'lon': (119, 135)},  # 东北湿润区
-        # --- 中部行 ---
-        'Z4-Tibetan':       {'lat': (27, 39), 'lon': (73, 95)},    # 青藏高寒区
-        'Z5-NorthChina':    {'lat': (34, 39), 'lon': (106, 122)},  # 黄土-华北区
-        'Z6-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},  # 长江中下游区
-        # --- 南部行 ---
-        'Z7-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},   # 四川-西南区
-        'Z8-SouthChina':    {'lat': (21, 25), 'lon': (106, 120)},  # 华南湿润区
-        'Z9-SouthSea':      {'lat': (18, 21), 'lon': (105, 125)}   # 南海热带区
+        'Z1-Northwest':     {'lat': (36, 50), 'lon': (73, 95)},   # 西北干旱区
+        'Z2-InnerMongolia': {'lat': (39, 45), 'lon': (95, 117)},  # 内蒙半干旱区
+        'Z3-Northeast':     {'lat': (40, 54), 'lon': (117, 135)},  # 东北湿润区
+        'Z4-Tibetan':       {'lat': (26, 37), 'lon': (77, 96)},    # 青藏高寒区
+        'Z5-CentralChina':  {'lat': (33, 40), 'lon': (96, 113)},    #华中
+        'Z6-NorthChina':    {'lat': (34, 40), 'lon': (113, 123)},  # 华北区
+        'Z7-Yangtze':       {'lat': (26, 34), 'lon': (108, 123)},  # 长江中下游区
+        'Z8-Southwest':     {'lat': (22, 33), 'lon': (96, 108)},   # 四川-西南区
+        'Z9-SouthChina':    {'lat': (18, 27), 'lon': (106, 125)}  # 华南湿润区
     })
-
     return regions
 
 REGIONS = generate_regions()
