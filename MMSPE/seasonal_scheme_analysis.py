@@ -76,15 +76,15 @@ def get_dynamic_lead_time(target_month: int, season: str, scheme: str) -> int:
 def generate_regions():
     regions = {'Global': None}
     regions.update({
-        'Z1-Northwest':     {'lat': (39, 49), 'lon': (73, 105)},
-        'Z2-InnerMongolia': {'lat': (39, 50), 'lon': (106, 118)},
-        'Z3-Northeast':     {'lat': (40, 54), 'lon': (119, 135)},
-        'Z4-Tibetan':       {'lat': (27, 39), 'lon': (73, 95)},
-        'Z5-NorthChina':    {'lat': (34, 39), 'lon': (106, 122)},
-        'Z6-Yangtze':       {'lat': (26, 34), 'lon': (109, 123)},
-        'Z7-Southwest':     {'lat': (23, 33), 'lon': (96, 108)},
-        'Z8-SouthChina':    {'lat': (21, 25), 'lon': (106, 120)},
-        'Z9-SouthSea':      {'lat': (18, 21), 'lon': (105, 125)}
+        'Z1-Northwest':     {'lat': (36, 50), 'lon': (73, 95)},   # 西北干旱区
+        'Z2-InnerMongolia': {'lat': (39, 45), 'lon': (95, 117)},  # 内蒙半干旱区
+        'Z3-Northeast':     {'lat': (40, 54), 'lon': (117, 135)},  # 东北湿润区
+        'Z4-Tibetan':       {'lat': (26, 37), 'lon': (77, 96)},    # 青藏高寒区
+        'Z5-CentralChina':  {'lat': (33, 40), 'lon': (96, 113)},    #华中
+        'Z6-NorthChina':    {'lat': (34, 40), 'lon': (113, 123)},  # 华北区
+        'Z7-Yangtze':       {'lat': (26, 34), 'lon': (108, 123)},  # 长江中下游区
+        'Z8-Southwest':     {'lat': (22, 33), 'lon': (96, 108)},   # 四川-西南区
+        'Z9-SouthChina':    {'lat': (18, 27), 'lon': (106, 125)}  # 华南湿润区
     })
     return regions
 
@@ -439,9 +439,9 @@ class SeasonalSchemePearsonAnalyzerV3:
         横轴为 4 个季节，呈现 Spread (核密度分布)、单模式均值、和 MMM
         所有子图共用相同的纵坐标范围 (保留一位小数)。
         """
-        regions_order = ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast', 
-                         'Z4-Tibetan', 'Z5-NorthChina', 'Z6-Yangtze', 
-                         'Z7-Southwest', 'Z8-SouthChina', 'Z9-SouthSea']
+        regions_order = ['Z1-Northwest', 'Z2-InnerMongolia', 'Z3-Northeast',
+                        'Z4-Tibetan',   'Z5-CentralChina',  'Z6-NorthChina',
+                        'Z7-Yangtze',   'Z8-Southwest',     'Z9-SouthChina']
         
         regions_to_plot = [r for r in regions_order if r in REGIONS]
         seasons = ['DJF', 'MAM', 'JJA', 'SON']
