@@ -6,13 +6,19 @@ Index Analysis
 1. 计算和分析 EAWM (East Asian Winter Monsoon) 指数
 2. 计算和分析 Nino3.4 指数
 3. 绘制多模式平均 (MMM) 时间序列图 (参考 nino34_eawm_index_calculation.ipynb 的绘图逻辑)
+4. 计算 Nino 3.4 Heidke Skill Score (基于 NOAA/CMA 严格业务标准的 HSS 评分)
+   - 输出详细列联表数据（正确率、空报率等），严格分离 Model 和 Leadtime
+   - 绘制不同模式随 Leadtime 变化的 HSS 折线图 (样式已与 MMSPE 模块全面对齐)
+5. 支持 --plot-only 模式，利用 pickle 缓存解耦计算与绘图，实现极速重绘。
 
 使用方法：
-python index_analysis.py --models all --leadtimes 0 3
+首次计算并绘图：python index_analysis.py --models all --leadtimes 0 1 2 3 4 5
+修改图表快速重绘：python index_analysis.py --models all --leadtimes 0 1 2 3 4 5 --plot-only
 """
 
 import sys
 import os
+import pickle
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -21,6 +27,7 @@ import pandas as pd
 import xarray as xr
 import warnings
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 from scipy.stats import pearsonr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -33,7 +40,6 @@ from common_config import (
     LEADTIMES,
     CLIMATOLOGY_PERIOD,
     SPATIAL_BOUNDS as COMMON_SPATIAL_BOUNDS,
-    COLORS,
 )
 
 from src.utils.data_loader import DataLoader
@@ -42,7 +48,7 @@ from src.utils.cli_args import create_parser, parse_models, parse_leadtimes, nor
 
 warnings.filterwarnings('ignore')
 
-# 配置绘图参数 (参考 notebook)
+# 配置绘图参数
 plt.rcParams['xtick.labelsize'] = 14
 plt.rcParams['ytick.labelsize'] = 14
 plt.rcParams['axes.titlesize'] = 16
@@ -62,13 +68,8 @@ SPATIAL_BOUNDS = COMMON_SPATIAL_BOUNDS
 def _worker_task(model, leadtime):
     """
     独立函数用于多进程执行。
-    必须在类外部定义，以便被 pickle 序列化。
     """
-    # 在子进程中重新初始化 Analyzer，避免共享状态
-    # 这里的开销很小，因为只有计算逻辑，没有预加载大文件
     analyzer = IndexAnalyzer() 
-    
-    # 调用原有的处理逻辑
     return (model, leadtime), analyzer._process_single_model_leadtime(model, leadtime)
 # ==========================================================
 
@@ -79,16 +80,20 @@ class IndexAnalyzer:
     def __init__(self, data_loader: DataLoader = None):
         self.data_loader = data_loader or DataLoader()
         logger.info(f"初始化指数分析器")
+        
+        # 统一输出路径配置
+        self.base_dir = Path("/sas12t1/ffyan/output/index_analysis")
+        self.results_dir = self.base_dir / "results"
+        self.plots_dir = self.base_dir / "plots"
+        self.cache_file = self.base_dir / "cache" / "index_analysis_cache.pkl"
+        
+        for d in [self.results_dir, self.plots_dir, self.cache_file.parent]:
+            d.mkdir(parents=True, exist_ok=True)
 
     def area_weighted_mean(self, da: xr.DataArray, lat_name: str = 'lat') -> xr.DataArray:
-        """
-        计算面积加权平均（使用 cos(latitude) 权重）
-        """
+        """计算面积加权平均（使用 cos(latitude) 权重）"""
         try:
-            # 计算权重：cos(latitude in radians)
             weights = np.cos(np.deg2rad(da[lat_name]))
-            
-            # 对空间维度进行加权平均
             if 'lon' in da.dims:
                 da_lon_mean = da.mean(dim='lon')
             else:
@@ -101,9 +106,7 @@ class IndexAnalyzer:
             raise
 
     def compute_monthly_anomaly(self, series: xr.DataArray, baseline: str = CLIMATOLOGY_PERIOD) -> Optional[xr.DataArray]:
-        """
-        计算逐月气候态异常
-        """
+        """计算逐月气候态异常"""
         try:
             start_year, end_year = baseline.split('-')
             clim_data = series.sel(time=slice(f"{start_year}-01-01", f"{end_year}-12-31"))
@@ -118,27 +121,19 @@ class IndexAnalyzer:
 
     def load_obs_pressure_level_data(self, var_name: str, pressure_level: int = 500,
                                      year_range: Tuple[int, int] = (1993, 2020)) -> Optional[xr.DataArray]:
-        """
-        从MonthlyPressureLevel加载观测数据 (修复纬度排序问题，避免 slice 切出空导致 NaN)
-        """
+        """从MonthlyPressureLevel加载观测数据"""
         try:
             obs_dir = Path("/sas12t1/ffyan/MonthlyPressureLevel")
-            
-            if not obs_dir.exists():
-                logger.error(f"观测数据目录不存在: {obs_dir}")
-                return None
+            if not obs_dir.exists(): return None
             
             logger.info(f"从MonthlyPressureLevel加载观测数据: {var_name} @ {pressure_level}hPa")
-            
             monthly_da_list = []
             start_year, end_year = year_range
             
             for year in range(start_year, end_year + 1):
                 for month in range(1, 13):
                     file_path = obs_dir / f"era5_pressure_levels_{year}{month:02d}.nc"
-                    
-                    if not file_path.exists():
-                        continue
+                    if not file_path.exists(): continue
                     
                     try:
                         with xr.open_dataset(file_path) as ds:
@@ -148,12 +143,9 @@ class IndexAnalyzer:
                                 if candidate in ds:
                                     actual_var = candidate
                                     break
-                            
-                            if actual_var is None:
-                                continue
+                            if actual_var is None: continue
                             
                             da = ds[actual_var]
-                            
                             level_coord = 'pressure_level' if 'pressure_level' in da.dims else 'level'
                             if level_coord in da.coords:
                                 if pressure_level in ds[level_coord].values:
@@ -165,177 +157,48 @@ class IndexAnalyzer:
                             if time_coord and da[time_coord].size > 0:
                                 da = da.isel({time_coord: 0})
                             
-                            if 'latitude' in da.coords:
-                                da = da.rename({'latitude': 'lat'})
-                            if 'longitude' in da.coords:
-                                da = da.rename({'longitude': 'lon'})
+                            if 'latitude' in da.coords: da = da.rename({'latitude': 'lat'})
+                            if 'longitude' in da.coords: da = da.rename({'longitude': 'lon'})
                             
-                            # 关键：确保纬度升序，否则 slice(25, 35) 在降序 lat 上返回空
                             if 'lat' in da.coords and da.lat.values[0] > da.lat.values[-1]:
                                 da = da.sortby('lat')
                             
                             time_stamp = pd.Timestamp(year, month, 1)
                             da = da.expand_dims(time=[time_stamp])
-                            
                             monthly_da_list.append(da.load())
-                        
-                    except Exception as e:
-                        logger.warning(f"处理文件 {file_path.name} 时出错: {e}")
+                    except Exception:
                         continue
             
-            if not monthly_da_list:
-                return None
-            
-            data = xr.concat(monthly_da_list, dim='time')
-            data = data.sortby('time')
+            if not monthly_da_list: return None
+            data = xr.concat(monthly_da_list, dim='time').sortby('time')
             if 'lat' in data.coords and data.lat.values[0] > data.lat.values[-1]:
                 data = data.sortby('lat')
             
-            logger.info(f"观测数据加载完成: {var_name} @ {pressure_level}hPa, shape={data.shape}")
             return data
-            
         except Exception as e:
             logger.error(f"加载观测气压层数据失败: {e}")
             return None
 
-    def load_era5_sst_daily(self, year_range: Tuple[int, int] = (1993, 2020),
-                             era5_root: str = '/sas12t1/ffyan/ERA5/daily-nc/single-level/') -> Optional[xr.DataArray]:
-        """
-        从本地加载 ERA5 SST 日值数据
-        参考 circulation_analysis.py 和 notebook 中的实现
-        
-        Args:
-            year_range: 年份范围，默认(1993, 2020)
-            era5_root: ERA5 single-level 数据根目录
-        
-        Returns:
-            日值数据 (time, lat, lon) 或 None
-        """
-        try:
-            var_name = 'sst'
-            var_dir = Path(era5_root) / var_name
-            
-            if not var_dir.exists():
-                logger.error(f"变量目录不存在: {var_dir}")
-                return None
-            
-            logger.info(f"从 ERA5 single-level 加载数据: {var_name}, 年份范围: {year_range}")
-            
-            start_year, end_year = year_range
-            
-            # 准备文件列表
-            monthly_da_list = []
-            for year in range(start_year, end_year + 1):
-                for month in range(1, 13):
-                    file_path = var_dir / f"era5_daily_{var_name}_{year}{month:02d}.nc"
-                    
-                    if not file_path.exists():
-                        continue
-                    
-                    try:
-                        with xr.open_dataset(file_path) as ds:
-                            # 查找SST变量（可能的名称）
-                            sst_vars = ['sst', 'tos', 'sea_surface_temperature', 'SST', 'TOS']
-                            actual_var = None
-                            for candidate in sst_vars:
-                                if candidate in ds:
-                                    actual_var = candidate
-                                    break
-                            
-                            if actual_var is None:
-                                continue
-                            
-                            da = ds[actual_var]
-                            
-                            # 标准化坐标名（ERA5 使用 latitude/longitude）
-                            if 'latitude' in da.coords and 'lat' not in da.coords:
-                                da = da.rename({'latitude': 'lat'})
-                            if 'longitude' in da.coords and 'lon' not in da.coords:
-                                da = da.rename({'longitude': 'lon'})
-                            
-                            # 确保数据已加载到内存（文件关闭后数据仍然可用）
-                            monthly_da_list.append(da.load())
-                        
-                    except Exception as e:
-                        logger.debug(f"加载文件失败 {year}{month:02d}: {e}")
-                        continue
-            
-            if not monthly_da_list:
-                logger.warning(f"未找到数据: {var_name}, 年份范围: {year_range}")
-                return None
-            
-            # 拼接所有月份数据
-            data = xr.concat(monthly_da_list, dim='time')
-            data = data.sortby('time')
-            
-            # 确保纬度是升序的（方便后续处理）
-            if 'lat' in data.coords and data.lat.values[0] > data.lat.values[-1]:
-                data = data.sortby('lat')
-                logger.debug("纬度已排序为升序")
-            
-            logger.info(f"ERA5 single-level 数据加载完成: {var_name}, shape={data.shape}")
-            return data
-            
-        except Exception as e:
-            logger.error(f"加载 ERA5 single-level 数据失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
-    def daily_to_monthly(self, da: xr.DataArray, var_name: str = 'sst') -> Optional[xr.DataArray]:
-        """
-        将日值数据聚合为月平均
-        参考 circulation_analysis.py 中的实现
-        
-        Args:
-            da: 日值数据 (time, lat, lon)
-            var_name: 变量名（用于选择聚合方法）
-        
-        Returns:
-            月平均数据 (time, lat, lon)
-        """
-        try:
-            logger.info(f"将日值数据聚合为月平均: {var_name}")
-            
-            # 对于 SST、T2M 等温度变量，使用平均值
-            monthly = da.resample(time='1MS').mean(dim='time')
-            
-            logger.info(f"月聚合完成: shape={monthly.shape}")
-            return monthly
-            
-        except Exception as e:
-            logger.error(f"月聚合失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
     def load_model_sst_monthly(self, model: str, leadtime: int,
                                 year_range: Tuple[int, int] = (1993, 2020)) -> Optional[xr.DataArray]:
-        """
-        【内存优化版】加载模式SST并直接计算区域平均
-        直接返回 Nino3.4 区域的平均值，而不是全球网格点，以避免 NCEP-2 (124 members) 爆内存
-        """
+        """【内存优化版】加载模式SST并直接计算区域平均"""
         try:
             forecast_dir = Path("/raid62/EC-C3S/month")
             model_dir = forecast_dir / model
             
-            if not model_dir.exists():
-                return None
+            if not model_dir.exists(): return None
             
             suffix = self.data_loader.models[model].get('sfc', None)
-            if suffix is None:
-                return None
+            if suffix is None: return None
             
-            logger.info(f"加载模式 SST 数据 (优化模式): {model} L{leadtime}")
-            
+            logger.info(f"加载模式 SST 数据: {model} L{leadtime}")
             monthly_values_list = []
             start_year, end_year = year_range
             
             for year in range(start_year, end_year + 1):
                 for month in range(1, 13):
                     file_path = model_dir / f"{year}{month:02d}.{suffix}.nc"
-                    if not file_path.exists():
-                        continue
+                    if not file_path.exists(): continue
                     
                     try:
                         with xr.open_dataset(file_path) as ds:
@@ -345,34 +208,25 @@ class IndexAnalyzer:
                                 if candidate in ds:
                                     actual_var = candidate
                                     break
-                            if actual_var is None:
-                                continue
+                            if actual_var is None: continue
                             
                             da = ds[actual_var]
                             
-                            # 时间选择
                             if 'time' in da.dims and da.time.size > leadtime:
                                 da = da.isel(time=leadtime)
                             elif 'time' in da.dims:
                                 init_time = pd.Timestamp(year, month, 1)
                                 try:
                                     da = da.sel(time=init_time, method='nearest', tolerance='15D')
-                                except Exception:
-                                    continue
+                                except Exception: continue
                             
-                            # 坐标标准化
-                            if 'latitude' in da.coords:
-                                da = da.rename({'latitude': 'lat'})
-                            if 'longitude' in da.coords:
-                                da = da.rename({'longitude': 'lon'})
+                            if 'latitude' in da.coords: da = da.rename({'latitude': 'lat'})
+                            if 'longitude' in da.coords: da = da.rename({'longitude': 'lon'})
                             
-                            # 关键修复：处理经度 (0-360)
                             if da.lon.min() < 0:
                                 da.coords['lon'] = (da.coords['lon'] + 360) % 360
                                 da = da.sortby('lon')
                             
-                            # 关键优化：立即裁剪 Nino3.4 区域
-                            # Nino3.4: 5S-5N, 190E-240E
                             da_nino = da.sel(lat=slice(-5, 5), lon=slice(190, 240))
                             if da_nino.size == 0:
                                 da_nino = da.sel(lat=slice(5, -5), lon=slice(190, 240))
@@ -380,27 +234,19 @@ class IndexAnalyzer:
                             if 'number' not in da_nino.dims:
                                 da_nino = da_nino.expand_dims('number')
                             
-                            # 关键优化：立即计算空间平均
                             weights = np.cos(np.deg2rad(da_nino.lat))
                             da_weighted = da_nino.weighted(weights)
                             spatial_mean = da_weighted.mean(dim=['lat', 'lon']).load()
                             
                             forecast_time = pd.Timestamp(year, month, 1) + pd.DateOffset(months=leadtime)
                             spatial_mean = spatial_mean.expand_dims(time=[forecast_time])
-                            
                             monthly_values_list.append(spatial_mean)
                             
                     except Exception:
                         continue
             
-            if not monthly_values_list:
-                return None
-            
-            data = xr.concat(monthly_values_list, dim='time')
-            data = data.sortby('time')
-            data = data.astype(np.float32)
-            
-            logger.info(f"模式 SST 数据处理完成: {model}, shape={data.shape}")
+            if not monthly_values_list: return None
+            data = xr.concat(monthly_values_list, dim='time').sortby('time').astype(np.float32)
             return data
             
         except Exception as e:
@@ -410,56 +256,36 @@ class IndexAnalyzer:
     # ========================== EAWM 指数相关 ==========================
 
     def compute_eawm_index(self, u_500: xr.DataArray) -> Optional[xr.DataArray]:
-        """
-        计算东亚冬季季风指数（I_EAWM）
-        基于 500hPa 纬向风 (u_south - u_north)，仅DJF季节，标准化。
-        """
+        """计算东亚冬季季风指数（I_EAWM）"""
         try:
-            logger.info("开始计算EAWM指数...")
-            
-            # 如果有number维度，先计算ensemble mean
             if 'number' in u_500.dims:
                 u_500_mean = u_500.mean(dim='number')
             else:
                 u_500_mean = u_500
             
-            # 定义两个区域
             south_region = {'lat': slice(25, 35), 'lon': slice(80, 120)}
             north_region = {'lat': slice(45, 55), 'lon': slice(80, 120)}
             
-            # 计算两个区域的空间平均（使用面积加权）
             u_south = self.area_weighted_mean(u_500_mean.sel(**south_region), lat_name='lat')
             u_north = self.area_weighted_mean(u_500_mean.sel(**north_region), lat_name='lat')
             
-            # 计算指数原型
             index_raw = u_south - u_north
-            
-            # 仅选择DJF季节（12、1、2月）
             djf_months = [12, 1, 2]
             index_djf = index_raw.sel(time=index_raw.time.dt.month.isin(djf_months))
             
-            if len(index_djf.time) < 3:
-                return None
+            if len(index_djf.time) < 3: return None
             
-            # z-score标准化
             index_values = index_djf.values
             index_mean = np.nanmean(index_values)
             index_std = np.nanstd(index_values)
             
-            if index_std < 1e-10:
-                return None
-            
+            if index_std < 1e-10: return None
             index_normalized = (index_values - index_mean) / index_std
             
-            # 创建结果DataArray
             index_result = xr.DataArray(
-                index_normalized,
-                coords={'time': index_djf.time},
-                dims=['time'],
-                name='eawm_index'
+                index_normalized, coords={'time': index_djf.time}, dims=['time'], name='eawm_index'
             )
             index_result.attrs = {'long_name': 'EAWM Index', 'season': 'DJF'}
-            
             return index_result
         except Exception as e:
             logger.error(f"计算EAWM指数失败: {e}")
@@ -470,16 +296,12 @@ class IndexAnalyzer:
     def compute_nino34_index_optimized(self, baseline: str = CLIMATOLOGY_PERIOD,
                                        era5_root: str = '/sas12t1/ffyan/ERA5/daily-nc/single-level/',
                                        year_range: Tuple[int, int] = (1993, 2020)) -> Optional[xr.DataArray]:
-        """
-        内存优化版：逐月处理并即时释放内存 (修复 ERA5 经度导致的 NaN)
-        """
+        """内存优化版：逐月处理并即时释放内存"""
         try:
             logger.info("启动内存优化模式计算 Nino3.4...")
             var_name = 'sst'
             var_dir = Path(era5_root) / var_name
-            
-            if not var_dir.exists():
-                return None
+            if not var_dir.exists(): return None
             
             start_year, end_year = year_range
             nino34_timeseries = []
@@ -487,8 +309,7 @@ class IndexAnalyzer:
             for year in range(start_year, end_year + 1):
                 for month in range(1, 13):
                     file_path = var_dir / f"era5_daily_{var_name}_{year}{month:02d}.nc"
-                    if not file_path.exists():
-                        continue
+                    if not file_path.exists(): continue
                     
                     try:
                         with xr.open_dataset(file_path) as ds:
@@ -498,56 +319,36 @@ class IndexAnalyzer:
                                 if candidate in ds:
                                     actual_var = candidate
                                     break
-                            if actual_var is None:
-                                continue
+                            if actual_var is None: continue
                             
                             da = ds[actual_var]
+                            if 'latitude' in da.coords: da = da.rename({'latitude': 'lat'})
+                            if 'longitude' in da.coords: da = da.rename({'longitude': 'lon'})
                             
-                            if 'latitude' in da.coords:
-                                da = da.rename({'latitude': 'lat'})
-                            if 'longitude' in da.coords:
-                                da = da.rename({'longitude': 'lon'})
-                            
-                            # 关键修复：ERA5 经度 - 若为 -180~180 则转为 0-360
                             if da.lon.min() < 0:
                                 da.coords['lon'] = (da.coords['lon'] + 360) % 360
                                 da = da.sortby('lon')
                             
                             da = da.sortby('lat')
                             da_sub = da.sel(lat=slice(-5, 5), lon=slice(190, 240))
-                            
-                            if da_sub.size == 0:
-                                logger.warning(f"ERA5 区域裁剪后为空: {year}-{month}")
-                                continue
+                            if da_sub.size == 0: continue
                             
                             da_mon = da_sub.resample(time='1MS').mean('time')
                             weights = np.cos(np.deg2rad(da_mon.lat))
                             da_weighted = da_mon.weighted(weights)
                             mean_val = da_weighted.mean(dim=['lat', 'lon']).load()
-                            
-                            if np.isnan(mean_val.values).all():
-                                logger.warning(f"ERA5 计算结果为 NaN: {year}-{month}")
-                            
                             nino34_timeseries.append(mean_val)
                             
-                    except Exception as e:
-                        logger.warning(f"处理文件失败 {year}-{month:02d}: {e}")
+                    except Exception:
                         continue
             
-            if not nino34_timeseries:
-                return None
-            
+            if not nino34_timeseries: return None
             nino34_da = xr.concat(nino34_timeseries, dim='time').sortby('time')
             
             start_year_str, end_year_str = baseline.split('-')
             clim_data = nino34_da.sel(time=slice(f"{start_year_str}-01-01", f"{end_year_str}-12-31"))
             clim = clim_data.groupby('time.month').mean('time')
             nino34_anom = nino34_da.groupby('time.month') - clim
-            
-            if np.isnan(nino34_anom.values).all():
-                logger.error("严重错误：ERA5 Nino3.4 指数全是 NaN！")
-            else:
-                logger.info(f"ERA5 Nino3.4 计算成功，有效值数量: {np.sum(~np.isnan(nino34_anom.values))}")
             
             nino34_anom.name = 'nino34_index'
             return nino34_anom
@@ -556,61 +357,13 @@ class IndexAnalyzer:
             logger.error(f"ERA5 计算失败: {e}")
             return None
 
-    def compute_nino34_index(self, sst_monthly: xr.DataArray, baseline: str = CLIMATOLOGY_PERIOD) -> Optional[xr.DataArray]:
-        """
-        计算 Nino3.4 指数 (SST anomaly in 5N-5S, 190E-240E)
-        """
-        try:
-            logger.info("计算 Nino3.4 指数...")
-            
-            # 裁剪到 Nino3.4 区域
-            nino34_region = sst_monthly.sel(lat=slice(-5, 5), lon=slice(190, 240))
-            if nino34_region.size == 0:
-                # 尝试反向切片
-                nino34_region = sst_monthly.sel(lat=slice(5, -5), lon=slice(190, 240))
-            
-            if nino34_region.size == 0:
-                logger.warning("Nino3.4 区域裁剪后无数据")
-                return None
-
-            # 计算面积加权空间平均
-            nino34_spatial_mean = self.area_weighted_mean(nino34_region, lat_name='lat')
-            
-            # 计算逐月异常
-            nino34_anomaly = self.compute_monthly_anomaly(nino34_spatial_mean, baseline)
-            
-            if nino34_anomaly is not None:
-                nino34_anomaly.name = 'nino34_index'
-                nino34_anomaly.attrs = {
-                    'long_name': 'Nino3.4 Index',
-                    'description': 'SST anomaly in Nino3.4 region (5N-5S, 190-240E)',
-                    'units': 'K'
-                }
-            
-            return nino34_anomaly
-        except Exception as e:
-            logger.error(f"计算 Nino3.4 指数失败: {e}")
-            return None
-
-    # ========================== 绘图逻辑 (来自 Notebook) ==========================
+    # ========================== 绘图逻辑 ==========================
 
     def plot_nino34_mmm(self, nino34_indices: Dict[str, xr.DataArray], output_file: Path, time_resolution: str = 'annual'):
-        """
-        绘制Nino3.4指数多模式平均时间序列图
-        逻辑源自 nino34_eawm_index_calculation.ipynb
-        
-        Args:
-            nino34_indices: Nino3.4指数字典 {'ERA5': DataArray, 'model_L0': DataArray, ...}
-            output_file: 输出文件路径
-            time_resolution: 时间分辨率，可选 'monthly'（逐月）、'annual'（年平均）、'seasonal'（季节平均）
-        """
+        """绘制Nino3.4指数多模式平均时间序列图"""
         try:
-            logger.info(f"绘制 Nino3.4 MMM 图: {time_resolution}")
-            
-            # 辅助函数：根据时间分辨率聚合数据
             def aggregate_data(times, values, resolution, season=None):
                 df = pd.DataFrame({'time': pd.DatetimeIndex(times), 'value': values})
-                
                 if resolution == 'monthly':
                     return df['time'].values, df['value'].values
                 elif resolution == 'annual':
@@ -630,8 +383,7 @@ class IndexAnalyzer:
                     df['season_year'] = df['year']
                     df.loc[df['month'] == 12, 'season_year'] = df.loc[df['month'] == 12, 'year'] + 1
                     
-                    if season is not None:
-                        df = df[df['season'] == season]
+                    if season is not None: df = df[df['season'] == season]
                     
                     df['season_key'] = df['season_year'].astype(str) + '-' + df['season']
                     seasonal = df.groupby('season_key')['value'].mean()
@@ -644,74 +396,47 @@ class IndexAnalyzer:
                 else:
                     raise ValueError(f"不支持的时间分辨率: {resolution}")
             
-            # 分离ERA5和各模式的数据
             era5_data = nino34_indices.get('ERA5')
-            if era5_data is None:
-                logger.warning("绘图缺少 ERA5 数据")
-                return
+            if era5_data is None: return
             
-            # 按leadtime分组
             model_data_l0 = {k.replace('_L0', ''): v for k, v in nino34_indices.items() if '_L0' in k}
             model_data_l3 = {k.replace('_L3', ''): v for k, v in nino34_indices.items() if '_L3' in k}
             
-            # 如果是季节平均，为每个季节分别生成一幅图
             if time_resolution == 'seasonal':
                 seasons = ['DJF', 'MAM', 'JJA', 'SON']
                 for season in seasons:
                     fig, ax = plt.subplots(figsize=(14, 7))
-                    
-                    # 聚合ERA5
                     era5_t, era5_v = aggregate_data(era5_data.time.values, era5_data.values, 'seasonal', season)
                     era5_t = pd.DatetimeIndex(era5_t)
                     ax.plot(era5_t, era5_v, color='black', linewidth=2.5, marker='o', markersize=4, label='ERA5', zorder=10)
                     
-                    # 处理 MMM
                     for leadtime, model_data, color, name in [(0, model_data_l0, 'red', 'L0'), (3, model_data_l3, 'blue', 'L3')]:
                         if len(model_data) > 1:
-                            # 聚合所有模型数据
                             model_aggs = {}
                             for m, d in model_data.items():
                                 t, v = aggregate_data(d.time.values, d.values, 'seasonal', season)
                                 model_aggs[m] = pd.Series(v, index=pd.DatetimeIndex(t))
                             
-                            # 计算 MMM
                             df_models = pd.DataFrame(model_aggs)
                             mmm = df_models.mean(axis=1)
                             std = df_models.std(axis=1)
                             common_t = mmm.index
-                            
-                            # 计算相关系数
-                            corr_str = ''
-                            # 简单对齐计算相关
-                            common_idx = era5_t.intersection(common_t)
-                            if len(common_idx) > 2:
-                                e_vals = pd.Series(era5_v, index=era5_t).loc[common_idx]
-                                m_vals = mmm.loc[common_idx]
-                                try:
-                                    r, _ = pearsonr(e_vals, m_vals)
-                                    corr_str = f' [r={r:.2f}]'
-                                except: pass
-                            
                             ax.plot(common_t, mmm, color=color, linewidth=2, linestyle='-' if leadtime==0 else '--', 
-                                    marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
-                            ax.fill_between(common_t, mmm-std, mmm+std, color=color, alpha=0.2, label=f'±1σ Spread ({name})')
+                                    marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name})', zorder=5)
+                            ax.fill_between(common_t, mmm-std, mmm+std, color=color, alpha=0.2)
 
-                    # 样式设置
                     ax.tick_params(axis='both', labelsize=20)
                     ax.set_ylabel('Nino3.4 Index (K)', fontsize=20, fontweight='bold')
-                    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=18, framealpha=0.9)
+                    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=18)
                     ax.grid(True, alpha=0.3, linestyle='--')
                     ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
                     plt.tight_layout()
-                    plt.subplots_adjust(bottom=0.2)
                     
                     s_out = output_file.parent / f"{output_file.stem}_{season.lower()}{output_file.suffix}"
                     plt.savefig(s_out, dpi=300, bbox_inches='tight')
                     plt.close()
-                    logger.info(f"已保存季节图: {s_out}")
                 return
 
-            # Monthly / Annual
             fig, ax = plt.subplots(figsize=(14, 7))
             era5_t, era5_v = aggregate_data(era5_data.time.values, era5_data.values, time_resolution)
             era5_t = pd.DatetimeIndex(era5_t)
@@ -729,74 +454,40 @@ class IndexAnalyzer:
                     std = df_models.std(axis=1)
                     common_t = mmm.index
                     
-                    corr_str = ''
-                    common_idx = era5_t.intersection(common_t)
-                    if len(common_idx) > 2:
-                        e_vals = pd.Series(era5_v, index=era5_t).loc[common_idx]
-                        m_vals = mmm.loc[common_idx]
-                        try:
-                            r, _ = pearsonr(e_vals, m_vals)
-                            corr_str = f' [r={r:.2f}]'
-                        except: pass
-                    
                     ax.plot(common_t, mmm, color=color, linewidth=2, linestyle='-' if leadtime==0 else '--', 
-                            marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
-                    ax.fill_between(common_t, mmm-std, mmm+std, color=color, alpha=0.2, label=f'±1σ Spread ({name})')
+                            marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name})', zorder=5)
+                    ax.fill_between(common_t, mmm-std, mmm+std, color=color, alpha=0.2)
 
             ax.tick_params(axis='both', labelsize=20)
             ax.set_ylabel('Nino3.4 Index (K)', fontsize=20, fontweight='bold')
-            ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=18, framealpha=0.9)
+            ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=18)
             ax.grid(True, alpha=0.3, linestyle='--')
             ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
             plt.tight_layout()
-            plt.subplots_adjust(bottom=0.2)
-            
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
             plt.close()
-            logger.info(f"已保存图: {output_file}")
 
         except Exception as e:
             logger.error(f"绘制Nino3.4图失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
 
     def plot_eawm_index_timeseries(self, index_dict: Dict[str, xr.DataArray], output_file: Path):
-        """
-        绘制EAWM指数时间序列图 (修复 NaN 导致不显示：过滤 NaN 并正确算相关)
-        """
+        """绘制EAWM指数时间序列图"""
         try:
-            logger.info("绘制 EAWM 指数时间序列...")
-            
             data_frames = {}
             for name, da in index_dict.items():
-                if da is None or da.size == 0:
-                    continue
+                if da is None or da.size == 0: continue
                 times = pd.DatetimeIndex(da.time.values)
                 values = da.values
-                years = []
-                for t in times:
-                    if t.month == 12:
-                        years.append(t.year)
-                    else:
-                        years.append(t.year - 1)
-                s = pd.Series(values, index=years, name=name)
-                s = s.groupby(level=0).mean()
+                years = [t.year if t.month == 12 else t.year - 1 for t in times]
+                s = pd.Series(values, index=years, name=name).groupby(level=0).mean()
                 data_frames[name] = s
             
             era5_s = data_frames.get('ERA5')
-            if era5_s is None:
-                logger.warning("绘图缺少 ERA5 数据 (data_frames 中无 'ERA5')，将不绘制 ERA5 折线")
-            
             fig, ax = plt.subplots(figsize=(14, 7))
             
-            if era5_s is not None:
+            if era5_s is not None and not era5_s.dropna().empty:
                 era5_valid = era5_s.dropna()
-                if len(era5_valid) > 0:
-                    ax.plot(era5_valid.index, era5_valid.values,
-                           color='black', linewidth=2.5, marker='o', markersize=4,
-                           label='ERA5', zorder=10)
-                else:
-                    logger.warning("ERA5 数据全为 NaN，无法绘制")
+                ax.plot(era5_valid.index, era5_valid.values, color='black', linewidth=2.5, marker='o', label='ERA5', zorder=10)
             
             l0_models = [k for k in data_frames.keys() if '_L0' in k]
             l3_models = [k for k in data_frames.keys() if '_L3' in k]
@@ -806,75 +497,207 @@ class IndexAnalyzer:
                     df_m = pd.DataFrame({m: data_frames[m] for m in models})
                     mmm = df_m.mean(axis=1)
                     std = df_m.std(axis=1)
-                    
-                    corr_str = ''
-                    if era5_s is not None:
-                        common = era5_s.index.intersection(mmm.index)
-                        if len(common) > 2:
-                            v1 = era5_s.loc[common]
-                            v2 = mmm.loc[common]
-                            mask = ~np.isnan(v1) & ~np.isnan(v2)
-                            if np.sum(mask) > 2:
-                                try:
-                                    r, _ = pearsonr(v1[mask], v2[mask])
-                                    corr_str = f' [r={r:.2f}]'
-                                except Exception:
-                                    pass
-                    
                     ax.plot(mmm.index, mmm.values, color=color, linewidth=2, linestyle='-' if leadtime == 0 else '--',
-                            marker='o' if leadtime == 0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
-                    ax.fill_between(mmm.index, mmm - std, mmm + std, color=color, alpha=0.2, label=f'±1σ Spread ({name})')
+                            marker='o' if leadtime == 0 else 's', markersize=4, label=f'MMM ({name})', zorder=5)
+                    ax.fill_between(mmm.index, mmm - std, mmm + std, color=color, alpha=0.2)
 
             ax.tick_params(axis='both', labelsize=20)
             ax.set_ylabel('EAWM Index (Standardized)', fontsize=20, fontweight='bold')
-            ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=18, framealpha=0.9)
+            ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=18)
             ax.grid(True, alpha=0.3, linestyle='--')
             ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
             plt.tight_layout()
-            plt.subplots_adjust(bottom=0.2)
-            
             output_file.parent.mkdir(parents=True, exist_ok=True)
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            logger.info(f"EAWM 绘图完成: {output_file}")
             plt.close()
-            
         except Exception as e:
             logger.error(f"绘制 EAWM 图失败: {e}")
+
+    def compute_nino34_hss(self, nino34_indices: Dict[str, xr.DataArray], output_dir: Path):
+        """
+        计算各模式与 ERA5 在 Nino3.4 指数上的 Heidke Skill Score (HSS)。
+        计算列联表：正确率、空报率、漏报率等详细信息。
+        """
+        try:
+            logger.info("开始计算 Nino3.4 Heidke Skill Score 及列联表数据...")
+            if 'ERA5' not in nino34_indices:
+                logger.warning("缺少 ERA5 数据，无法计算 HSS")
+                return
+            
+            era5_da = nino34_indices['ERA5']
+            
+            def classify_series_standard(da: xr.DataArray) -> pd.Series:
+                s = pd.Series(da.values, index=pd.DatetimeIndex(da.time.values))
+                # 3个月滑动平均（ONI/Z值）
+                oni = s.rolling(window=3, min_periods=3, center=True).mean()
+                
+                is_el = oni >= 0.5
+                is_la = oni <= -0.5
+                
+                # 滑动窗口检验：连续 5 个月
+                el_5 = is_el.rolling(window=5, min_periods=5).sum() == 5
+                la_5 = is_la.rolling(window=5, min_periods=5).sum() == 5
+                
+                # 回溯标记
+                el_mask = el_5.copy()
+                la_mask = la_5.copy()
+                for i in range(1, 5):
+                    el_mask = el_mask | el_5.shift(-i, fill_value=False)
+                    la_mask = la_mask | la_5.shift(-i, fill_value=False)
+                
+                classes = pd.Series(0, index=oni.index)
+                classes[el_mask] = 1   # El Nino 事件
+                classes[la_mask] = -1  # La Nina 事件
+                classes[oni.isna()] = np.nan
+                return classes
+
+            obs_classes = classify_series_standard(era5_da)
+            
+            hss_results = []
+            for model_name, model_da in nino34_indices.items():
+                if model_name == 'ERA5': continue
+                
+                mod_classes = classify_series_standard(model_da)
+                common_times = obs_classes.dropna().index.intersection(mod_classes.dropna().index)
+                if len(common_times) == 0: continue
+                    
+                obs_align = obs_classes.loc[common_times]
+                mod_align = mod_classes.loc[common_times]
+                
+                # 构建列联表 (-1: La Nina, 0: Neutral, 1: El Nino)
+                categories = [-1, 0, 1]
+                conf_matrix = pd.crosstab(obs_align, mod_align, dropna=False)
+                conf_matrix = conf_matrix.reindex(index=categories, columns=categories, fill_value=0)
+                
+                T = conf_matrix.values.sum()
+                if T == 0: continue
+                H = np.trace(conf_matrix.values)
+                E = np.sum((conf_matrix.sum(axis=1).values * conf_matrix.sum(axis=0).values)) / T
+                
+                hss = 0.0 if T == E else (H - E) / (T - E)
+                accuracy = H / T if T > 0 else 0.0
+                
+                # 各类事件指标
+                obs_el = conf_matrix.loc[1].sum()
+                pred_el = conf_matrix[1].sum()
+                hit_el = conf_matrix.loc[1, 1]
+                far_el = (pred_el - hit_el) / pred_el if pred_el > 0 else np.nan  
+                pod_el = hit_el / obs_el if obs_el > 0 else np.nan                
+                
+                obs_la = conf_matrix.loc[-1].sum()
+                pred_la = conf_matrix[-1].sum()
+                hit_la = conf_matrix.loc[-1, -1]
+                far_la = (pred_la - hit_la) / pred_la if pred_la > 0 else np.nan
+                pod_la = hit_la / obs_la if obs_la > 0 else np.nan
+                
+                obs_nu = conf_matrix.loc[0].sum()
+                pred_nu = conf_matrix[0].sum()
+                hit_nu = conf_matrix.loc[0, 0]
+                far_nu = (pred_nu - hit_nu) / pred_nu if pred_nu > 0 else np.nan
+                pod_nu = hit_nu / obs_nu if obs_nu > 0 else np.nan
+
+                # 剥离并独立保存 Model 和 Leadtime
+                base_model = model_name.split('_L')[0] if '_L' in model_name else model_name
+                leadtime_val = int(model_name.split('_L')[-1]) if '_L' in model_name else 0
+
+                hss_results.append({
+                    'Model': base_model,
+                    'Leadtime': leadtime_val,
+                    'HSS': hss,
+                    'Accuracy': accuracy,
+                    'Total_Samples': T,
+                    'Obs_El_Nino': obs_el,
+                    'Pred_El_Nino': pred_el,
+                    'Hit_El_Nino': hit_el,
+                    'POD_El_Nino': pod_el,
+                    'FAR_El_Nino': far_el,
+                    'Obs_La_Nina': obs_la,
+                    'Pred_La_Nina': pred_la,
+                    'Hit_La_Nina': hit_la,
+                    'POD_La_Nina': pod_la,
+                    'FAR_La_Nina': far_la,
+                    'Obs_Neutral': obs_nu,
+                    'Pred_Neutral': pred_nu,
+                    'Hit_Neutral': hit_nu,
+                    'POD_Neutral': pod_nu,
+                    'FAR_Neutral': far_nu
+                })
+                
+            if hss_results:
+                df_hss = pd.DataFrame(hss_results)
+                output_csv = output_dir / "nino34_contingency_and_hss_standard.csv"
+                df_hss.to_csv(output_csv, index=False)
+                logger.info(f"HSS 及其列联表计算完成，保存至: {output_csv}")
+                
+                self.plot_hss_lines(df_hss, output_dir / "nino34_hss_lines.png")
+                
+        except Exception as e:
+            logger.error(f"计算 HSS 失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def plot_hss_lines(self, df_hss: pd.DataFrame, output_file: Path):
+        """绘制横轴为 Leadtime 的多模式 HSS 折线图 (兼容 MMSPE 样式)"""
+        try:
+            logger.info("绘制 HSS 折线图...")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # 从全局配置中获取模型列表以保持固定的颜色映射顺序 (与 MMSPE tab10 一致)
+            models = [m for m in MODELS if m in df_hss['Model'].unique()]
+            for m in df_hss['Model'].unique():
+                if m not in models: models.append(m)
+                    
+            leadtimes = sorted(df_hss['Leadtime'].unique())
+            cmap = plt.get_cmap('tab10')
+            
+            for idx, model in enumerate(MODELS):
+                if model not in df_hss['Model'].values: continue
+                
+                model_data = df_hss[df_hss['Model'] == model].sort_values('Leadtime')
+                if model_data.empty: continue
+                
+                display_name = model.replace('-mon','').replace('Meteo-France','MF').replace('ECCC-Canada', 'ECCC-3')
+                color = cmap(idx % 10)
+                
+                ax.plot(model_data['Leadtime'], model_data['HSS'], marker='o', 
+                        linewidth=2.5, markersize=8, label=display_name, color=color, alpha=0.9, 
+                        markeredgecolor='white', markeredgewidth=0.5)
+            
+            # Formatting
+            # ax.set_xlabel('Lead Time (Months)', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Heidke Skill Score (HSS)', fontsize=14, fontweight='bold')
+            # ax.set_title('Nino3.4 Heidke Skill Score Decay by Model', fontsize=16, fontweight='bold')
+            
+            ax.set_xticks(leadtimes)
+            ax.set_xticklabels([f"Lead {lt}" for lt in leadtimes], fontsize=12)
+            
+            # y-axis formatting to 1 decimal place to match MMSPE
+            ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+            
+            # Legend at bottom center
+            handles, labels = ax.get_legend_handles_labels()
+            fig.legend(handles, labels, loc='lower center', 
+                       bbox_to_anchor=(0.5, -0.05), ncol=min(len(models), 6), fontsize=12, frameon=False)
+            
+            ax.grid(True, linestyle=':', alpha=0.6)
+            
+            plt.subplots_adjust(bottom=0.15)
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            logger.info(f"HSS 折线图已保存: {output_file}")
+            
+        except Exception as e:
+            logger.error(f"绘制 HSS 折线图失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
     def _process_single_model_leadtime(self, model: str, leadtime: int) -> Tuple[Optional[xr.DataArray], Optional[xr.DataArray]]:
-        """
-        处理单个模型和提前期的EAWM和Nino3.4指数计算
-        用于并行处理的包装函数
-        
-        Args:
-            model: 模型名称
-            leadtime: 提前期
-        
-        Returns:
-            (eawm_index, nino34_index) 元组，如果计算失败则返回 (None, None)
-        """
         try:
-            logger.info(f"处理 {model} L{leadtime}...")
-            eawm_index = None
-            nino34_index = None
-            
-            # EAWM (U500)
-            u500_model = self.data_loader.load_pressure_level_data(
-                model=model,
-                leadtime=leadtime,
-                var_name='u',
-                pressure_level=500
-            )
+            eawm_index, nino34_index = None, None
+            u500_model = self.data_loader.load_pressure_level_data(model=model, leadtime=leadtime, var_name='u', pressure_level=500)
             if u500_model is not None:
                 eawm_index = self.compute_eawm_index(u500_model)
-                if eawm_index is None:
-                    logger.warning(f"无法计算 {model} L{leadtime} EAWM指数")
-            else:
-                logger.warning(f"无法加载 {model} L{leadtime} U500 数据")
             
-            # Nino3.4 (SST)：load_model_sst_monthly 已直接返回 Nino3.4 区域平均
             sst_index_raw = self.load_model_sst_monthly(model, leadtime)
             if sst_index_raw is not None:
                 if 'number' in sst_index_raw.dims:
@@ -882,209 +705,121 @@ class IndexAnalyzer:
                 nino34_index = self.compute_monthly_anomaly(sst_index_raw)
                 if nino34_index is not None:
                     nino34_index.name = 'nino34_index'
-                else:
-                    logger.warning(f"无法计算 {model} L{leadtime} Nino3.4指数")
-            else:
-                logger.warning(f"无法加载 {model} L{leadtime} SST 数据")
             
             return eawm_index, nino34_index
-            
-        except Exception as e:
-            logger.error(f"处理 {model} L{leadtime} 出错: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+        except Exception:
             return None, None
 
-    def run_analysis(self, models: List[str], leadtimes: List[int], 
-                     parallel: bool = False, n_jobs: Optional[int] = None):
-        """
-        执行完整分析流程
-        
-        Args:
-            models: 模型列表
-            leadtimes: 提前期列表
-            parallel: 是否使用并行处理
-            n_jobs: 并行作业数（如果为None，则使用默认值）
-        """
-        results_dir = Path("/sas12t1/ffyan/output/index_analysis/results")
-        plots_dir = Path("/sas12t1/ffyan/output/index_analysis/plots")
-        results_dir.mkdir(parents=True, exist_ok=True)
-        plots_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 1. 加载/计算 ERA5 EAWM 指数 (需要 U500)
-        logger.info("Step 1: 处理 ERA5 EAWM 指数")
-        eawm_era5 = None
-        try:
-            # 首先尝试从已保存的文件加载
-            eawm_file = results_dir / "circulation_obs_eawm_index.nc"
-            if eawm_file.exists():
-                try:
-                    eawm_era5 = xr.open_dataarray(eawm_file).load()
-                    logger.info("已加载 ERA5 EAWM 指数文件")
-                except Exception as e:
-                    logger.warning(f"加载 EAWM 指数文件失败: {e}")
+    def _load_cache(self):
+        """从缓存加载计算结果"""
+        if not self.cache_file.exists():
+            raise FileNotFoundError(f"缓存文件不存在: {self.cache_file}. 请先不带 --plot-only 运行一次。")
+        with open(self.cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    def _save_cache(self, eawm_indices, nino34_indices):
+        """保存计算结果到缓存"""
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump({
+                'eawm_indices': eawm_indices,
+                'nino34_indices': nino34_indices,
+            }, f)
+        logger.info(f"已保存缓存: {self.cache_file}")
+
+    def run_analysis(self, models: List[str], leadtimes: List[int], parallel: bool = False, n_jobs: Optional[int] = None, plot_only: bool = False):
+        if plot_only:
+            logger.info("--plot-only 模式: 从缓存加载数据并仅绘图")
+            cache = self._load_cache()
+            eawm_indices = cache.get('eawm_indices', {})
+            nino34_indices = cache.get('nino34_indices', {})
             
-            # 如果文件不存在，则从原始数据计算
-            if eawm_era5 is None:
-                logger.info("开始从ERA5数据计算EAWM指数...")
+            if len(eawm_indices) > 0:
+                self.plot_eawm_index_timeseries(eawm_indices, self.plots_dir / "circulation_eawm_index_mmm.png")
+            
+            if len(nino34_indices) > 0:
+                self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_monthly.png", 'monthly')
+                self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_annual.png", 'annual')
+                self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_seasonal.png", 'seasonal')
+                self.compute_nino34_hss(nino34_indices, self.plots_dir)
+            return
+
+        eawm_era5, nino34_era5 = None, None
+        try:
+            eawm_file = self.results_dir / "circulation_obs_eawm_index.nc"
+            if eawm_file.exists(): eawm_era5 = xr.open_dataarray(eawm_file).load()
+            else:
                 u500_era5 = self.load_obs_pressure_level_data('u', 500)
                 if u500_era5 is not None:
                     eawm_era5 = self.compute_eawm_index(u500_era5)
-                    if eawm_era5 is not None:
-                        # 保存计算结果
-                        eawm_file.parent.mkdir(parents=True, exist_ok=True)
-                        eawm_era5.to_netcdf(eawm_file)
-                        logger.info(f"EAWM指数已保存到: {eawm_file}")
-                else:
-                    logger.warning("无法加载 ERA5 U500 数据")
-        except Exception as e:
-            logger.warning(f"ERA5 EAWM 计算受阻: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            eawm_era5 = None
+                    if eawm_era5 is not None: eawm_era5.to_netcdf(eawm_file)
+        except Exception: pass
 
-        # 2. 加载/计算 ERA5 Nino3.4 指数 (需要 SST)
-        logger.info("Step 2: 处理 ERA5 Nino3.4 指数")
-        nino34_era5 = None
         try:
-            # 首先尝试从已保存的文件加载
-            nino34_file = results_dir / "circulation_nino34_era5.nc"
-            if nino34_file.exists():
-                try:
-                    nino34_era5 = xr.open_dataarray(nino34_file)
-                    logger.info("已加载 ERA5 Nino3.4 指数文件")
-                except Exception as e:
-                    logger.warning(f"加载 Nino3.4 指数文件失败: {e}")
-            
-            # 如果文件不存在，则从原始数据计算
-            if nino34_era5 is None:
-                logger.info("开始从ERA5数据计算Nino3.4指数（使用内存优化模式）...")
-                # 使用内存优化版本：逐月处理，不一次性加载所有数据
+            nino34_file = self.results_dir / "circulation_nino34_era5.nc"
+            if nino34_file.exists(): nino34_era5 = xr.open_dataarray(nino34_file)
+            else:
                 nino34_era5 = self.compute_nino34_index_optimized()
-                if nino34_era5 is not None:
-                    # 保存计算结果
-                    nino34_file.parent.mkdir(parents=True, exist_ok=True)
-                    nino34_era5.to_netcdf(nino34_file)
-                    logger.info(f"Nino3.4指数已保存到: {nino34_file}")
-                else:
-                    logger.warning("无法计算 ERA5 Nino3.4 指数")
-        except Exception as e:
-            logger.warning(f"ERA5 Nino3.4 计算受阻: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            nino34_era5 = None
+                if nino34_era5 is not None: nino34_era5.to_netcdf(nino34_file)
+        except Exception: pass
         
-        # 3. 处理各模式
-        eawm_indices = {}
-        nino34_indices = {}
-        
+        eawm_indices, nino34_indices = {}, {}
         if eawm_era5 is not None: eawm_indices['ERA5'] = eawm_era5
         if nino34_era5 is not None: nino34_indices['ERA5'] = nino34_era5
         
-        # 准备任务列表
         model_tasks = [(model, leadtime) for leadtime in leadtimes for model in models]
         
         if parallel and n_jobs and n_jobs > 1 and len(model_tasks) > 1:
-            # === 修改开始：使用 ProcessPoolExecutor (多进程) ===
             from concurrent.futures import ProcessPoolExecutor, as_completed
-            # 注意：不需再限制为 16 或更小，进程池通常受限于 CPU 核数或内存
-            # 如果内存吃紧，请适当调小 n_jobs
-            max_workers = n_jobs 
-            
-            logger.info(f"使用并行处理 (多进程): {max_workers} Workers")
-            
             parallel_failed = False
             try:
-                # 使用 ProcessPoolExecutor 替代 ThreadPoolExecutor
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    # 提交顶层函数 _worker_task，而不是类方法
-                    future_to_task = {
-                        executor.submit(_worker_task, model, leadtime): (model, leadtime)
-                        for model, leadtime in model_tasks
-                    }
-                    
-                    completed = 0
+                with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+                    future_to_task = {executor.submit(_worker_task, model, leadtime): (model, leadtime) for model, leadtime in model_tasks}
                     for future in as_completed(future_to_task):
-                        task = future_to_task[future]
                         try:
-                            # 获取返回值
                             (model, leadtime), (eawm_index, nino34_index) = future.result(timeout=1800)
-                            
-                            if eawm_index is not None:
-                                eawm_indices[f"{model}_L{leadtime}"] = eawm_index
-                            if nino34_index is not None:
-                                nino34_indices[f"{model}_L{leadtime}"] = nino34_index
-                            
-                            completed += 1
-                            logger.info(f"完成 {completed}/{len(model_tasks)}: {model} L{leadtime}")
-                        except Exception as e:
-                            logger.error(f"任务失败 {task}: {e}")
-                            # import traceback
-                            # logger.error(traceback.format_exc())
-                
-                logger.info(f"并行处理完成: {completed}/{len(model_tasks)} 成功")
-            except (Exception, SystemError, OSError) as e:
-                logger.error(f"并行处理失败: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                logger.info("回退到串行处理...")
+                            if eawm_index is not None: eawm_indices[f"{model}_L{leadtime}"] = eawm_index
+                            if nino34_index is not None: nino34_indices[f"{model}_L{leadtime}"] = nino34_index
+                        except Exception: pass
+            except Exception:
                 parallel_failed = True
-            # === 修改结束 ===
             
-            # 如果并行失败，使用串行处理
             if parallel_failed:
                 for model, leadtime in model_tasks:
                     eawm_index, nino34_index = self._process_single_model_leadtime(model, leadtime)
-                    if eawm_index is not None:
-                        eawm_indices[f"{model}_L{leadtime}"] = eawm_index
-                    if nino34_index is not None:
-                        nino34_indices[f"{model}_L{leadtime}"] = nino34_index
+                    if eawm_index is not None: eawm_indices[f"{model}_L{leadtime}"] = eawm_index
+                    if nino34_index is not None: nino34_indices[f"{model}_L{leadtime}"] = nino34_index
         else:
-            # 串行处理
-            logger.info("使用串行处理模式")
             for model, leadtime in model_tasks:
                 eawm_index, nino34_index = self._process_single_model_leadtime(model, leadtime)
-                if eawm_index is not None:
-                    eawm_indices[f"{model}_L{leadtime}"] = eawm_index
-                if nino34_index is not None:
-                    nino34_indices[f"{model}_L{leadtime}"] = nino34_index
+                if eawm_index is not None: eawm_indices[f"{model}_L{leadtime}"] = eawm_index
+                if nino34_index is not None: nino34_indices[f"{model}_L{leadtime}"] = nino34_index
 
-        # 4. 绘图
+        # 落盘缓存
+        self._save_cache(eawm_indices, nino34_indices)
+
+        # 执行绘图
         if len(eawm_indices) > 0:
-            if 'ERA5' not in eawm_indices:
-                logger.warning("eawm_indices 中缺少 ERA5，图中将无 ERA5 折线；请检查 results/circulation_obs_eawm_index.nc 是否存在且可读")
-            self.plot_eawm_index_timeseries(eawm_indices, plots_dir / "circulation_eawm_index_mmm.png")
+            self.plot_eawm_index_timeseries(eawm_indices, self.plots_dir / "circulation_eawm_index_mmm.png")
         
         if len(nino34_indices) > 0:
-            # 绘制不同分辨率的图
-            self.plot_nino34_mmm(nino34_indices, plots_dir / "circulation_nino34_index_mmm_monthly.png", 'monthly')
-            self.plot_nino34_mmm(nino34_indices, plots_dir / "circulation_nino34_index_mmm_annual.png", 'annual')
-            self.plot_nino34_mmm(nino34_indices, plots_dir / "circulation_nino34_index_mmm_seasonal.png", 'seasonal')
+            self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_monthly.png", 'monthly')
+            self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_annual.png", 'annual')
+            self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_seasonal.png", 'seasonal')
+            
+            # 计算详细列联表并绘制折线图
+            self.compute_nino34_hss(nino34_indices, self.plots_dir)
 
 def main():
     parser = create_parser(description="指数分析：EAWM 和 Nino3.4", var_required=False)
     args = parser.parse_args()
     
     models = parse_models(args.models, MODEL_LIST) if args.models else MODEL_LIST
-    leadtimes = parse_leadtimes(args.leadtimes, LEADTIMES) if args.leadtimes else LEADTIMES
-    
-    # 解析并行参数
+    leadtimes = parse_leadtimes(args.leadtimes, [0, 1, 2, 3, 4, 5]) if args.leadtimes else [0, 1, 2, 3, 4, 5]
     parallel = normalize_parallel_args(args)
-    
-    logger.info(f"模型列表: {models}")
-    logger.info(f"提前期列表: {leadtimes}")
-    logger.info(f"并行处理: {parallel}")
-    logger.info(f"并行作业数: {args.n_jobs}")
+    plot_only = getattr(args, 'plot_only', False)
     
     analyzer = IndexAnalyzer()
-    analyzer.run_analysis(
-        models=models,
-        leadtimes=leadtimes,
-        parallel=parallel,
-        n_jobs=args.n_jobs
-    )
-    
-    logger.info("所有任务完成！")
+    analyzer.run_analysis(models=models, leadtimes=leadtimes, parallel=parallel, n_jobs=args.n_jobs, plot_only=plot_only)
 
 if __name__ == "__main__":
     main()
