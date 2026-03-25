@@ -32,7 +32,6 @@ from scipy.stats import pearsonr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-# 添加工具包路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "climate_analysis_toolkit"))
 
 from common_config import (
@@ -48,30 +47,25 @@ from src.utils.cli_args import create_parser, parse_models, parse_leadtimes, nor
 
 warnings.filterwarnings('ignore')
 
-# 配置绘图参数
 plt.rcParams['xtick.labelsize'] = 14
 plt.rcParams['ytick.labelsize'] = 14
 plt.rcParams['axes.titlesize'] = 16
 plt.rcParams['axes.labelsize'] = 14
 
-# 配置日志
 logger = setup_logging(
     log_file='index_analysis.log',
     module_name=__name__
 )
 
-# 全局配置
 MODELS = MODEL_LIST
 SPATIAL_BOUNDS = COMMON_SPATIAL_BOUNDS
 
-# ================= 新增的多进程 Worker 函数 =================
 def _worker_task(model, leadtime):
     """
     独立函数用于多进程执行。
     """
     analyzer = IndexAnalyzer() 
     return (model, leadtime), analyzer._process_single_model_leadtime(model, leadtime)
-# ==========================================================
 
 class IndexAnalyzer:
     """
@@ -116,8 +110,6 @@ class IndexAnalyzer:
         except Exception as e:
             logger.error(f"计算月异常失败: {e}")
             return None
-
-    # ========================== 数据加载方法 ==========================
 
     def load_obs_pressure_level_data(self, var_name: str, pressure_level: int = 500,
                                      year_range: Tuple[int, int] = (1993, 2020)) -> Optional[xr.DataArray]:
@@ -253,8 +245,6 @@ class IndexAnalyzer:
             logger.error(f"加载模式 SST 数据失败: {e}")
             return None
 
-    # ========================== EAWM 指数相关 ==========================
-
     def compute_eawm_index(self, u_500: xr.DataArray) -> Optional[xr.DataArray]:
         """计算东亚冬季季风指数（I_EAWM）"""
         try:
@@ -290,8 +280,6 @@ class IndexAnalyzer:
         except Exception as e:
             logger.error(f"计算EAWM指数失败: {e}")
             return None
-
-    # ========================== Nino3.4 指数相关 ==========================
 
     def compute_nino34_index_optimized(self, baseline: str = CLIMATOLOGY_PERIOD,
                                        era5_root: str = '/sas12t1/ffyan/ERA5/daily-nc/single-level/',
@@ -533,12 +521,10 @@ class IndexAnalyzer:
                 
                 is_el = oni >= 0.5
                 is_la = oni <= -0.5
-                
-                # 滑动窗口检验：连续 5 个月
+
                 el_5 = is_el.rolling(window=5, min_periods=5).sum() == 5
                 la_5 = is_la.rolling(window=5, min_periods=5).sum() == 5
-                
-                # 回溯标记
+
                 el_mask = el_5.copy()
                 la_mask = la_5.copy()
                 for i in range(1, 5):
@@ -563,8 +549,7 @@ class IndexAnalyzer:
                     
                 obs_align = obs_classes.loc[common_times]
                 mod_align = mod_classes.loc[common_times]
-                
-                # 构建列联表 (-1: La Nina, 0: Neutral, 1: El Nino)
+
                 categories = [-1, 0, 1]
                 conf_matrix = pd.crosstab(obs_align, mod_align, dropna=False)
                 conf_matrix = conf_matrix.reindex(index=categories, columns=categories, fill_value=0)
@@ -576,8 +561,7 @@ class IndexAnalyzer:
                 
                 hss = 0.0 if T == E else (H - E) / (T - E)
                 accuracy = H / T if T > 0 else 0.0
-                
-                # 各类事件指标
+
                 obs_el = conf_matrix.loc[1].sum()
                 pred_el = conf_matrix[1].sum()
                 hit_el = conf_matrix.loc[1, 1]
@@ -596,7 +580,6 @@ class IndexAnalyzer:
                 far_nu = (pred_nu - hit_nu) / pred_nu if pred_nu > 0 else np.nan
                 pod_nu = hit_nu / obs_nu if obs_nu > 0 else np.nan
 
-                # 剥离并独立保存 Model 和 Leadtime
                 base_model = model_name.split('_L')[0] if '_L' in model_name else model_name
                 leadtime_val = int(model_name.split('_L')[-1]) if '_L' in model_name else 0
 
@@ -642,7 +625,6 @@ class IndexAnalyzer:
             logger.info("绘制 HSS 折线图...")
             fig, ax = plt.subplots(figsize=(10, 6))
             
-            # 从全局配置中获取模型列表以保持固定的颜色映射顺序 (与 MMSPE tab10 一致)
             models = [m for m in MODELS if m in df_hss['Model'].unique()]
             for m in df_hss['Model'].unique():
                 if m not in models: models.append(m)
@@ -663,18 +645,15 @@ class IndexAnalyzer:
                         linewidth=2.5, markersize=8, label=display_name, color=color, alpha=0.9, 
                         markeredgecolor='white', markeredgewidth=0.5)
             
-            # Formatting
+
             # ax.set_xlabel('Lead Time (Months)', fontsize=14, fontweight='bold')
             ax.set_ylabel('Heidke Skill Score (HSS)', fontsize=14, fontweight='bold')
-            # ax.set_title('Nino3.4 Heidke Skill Score Decay by Model', fontsize=16, fontweight='bold')
             
             ax.set_xticks(leadtimes)
             ax.set_xticklabels([f"Lead {lt}" for lt in leadtimes], fontsize=12)
-            
-            # y-axis formatting to 1 decimal place to match MMSPE
+
             ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
-            
-            # Legend at bottom center
+
             handles, labels = ax.get_legend_handles_labels()
             fig.legend(handles, labels, loc='lower center', 
                        bbox_to_anchor=(0.5, -0.05), ncol=min(len(models), 6), fontsize=12, frameon=False)
@@ -794,10 +773,8 @@ class IndexAnalyzer:
                 if eawm_index is not None: eawm_indices[f"{model}_L{leadtime}"] = eawm_index
                 if nino34_index is not None: nino34_indices[f"{model}_L{leadtime}"] = nino34_index
 
-        # 落盘缓存
         self._save_cache(eawm_indices, nino34_indices)
 
-        # 执行绘图
         if len(eawm_indices) > 0:
             self.plot_eawm_index_timeseries(eawm_indices, self.plots_dir / "circulation_eawm_index_mmm.png")
         
@@ -806,7 +783,6 @@ class IndexAnalyzer:
             self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_annual.png", 'annual')
             self.plot_nino34_mmm(nino34_indices, self.plots_dir / "circulation_nino34_index_mmm_seasonal.png", 'seasonal')
             
-            # 计算详细列联表并绘制折线图
             self.compute_nino34_hss(nino34_indices, self.plots_dir)
 
 def main():
