@@ -405,13 +405,28 @@ class IndexAnalyzer:
                                 t, v = aggregate_data(d.time.values, d.values, 'seasonal', season)
                                 model_aggs[m] = pd.Series(v, index=pd.DatetimeIndex(t))
                             
-                            df_models = pd.DataFrame(model_aggs)
+                            df_models = pd.DataFrame(model_aggs).dropna()
+                            if df_models.empty: continue
+                            
                             mmm = df_models.mean(axis=1)
-                            std = df_models.std(axis=1)
+                            model_min = df_models.min(axis=1)
+                            model_max = df_models.max(axis=1)
                             common_t = mmm.index
+                            
+                            # 计算相关系数图例
+                            corr_str = ''
+                            era5_series = pd.Series(era5_v, index=era5_t)
+                            common_era5_t = era5_series.index.intersection(common_t)
+                            if len(common_era5_t) > 2:
+                                try:
+                                    corr, _ = pearsonr(era5_series.loc[common_era5_t], mmm.loc[common_era5_t])
+                                    corr_str = f' [r={corr:.2f}]'
+                                except Exception:
+                                    pass
+
                             ax.plot(common_t, mmm, color=color, linewidth=2, linestyle='-' if leadtime==0 else '--', 
-                                    marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name})', zorder=5)
-                            ax.fill_between(common_t, mmm-std, mmm+std, color=color, alpha=0.2)
+                                    marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
+                            ax.fill_between(common_t, model_min, model_max, color=color, alpha=0.2, label=f'Spread ({name})', zorder=4)
 
                     ax.tick_params(axis='both', labelsize=20)
                     ax.set_ylabel('Nino3.4 Index (K)', fontsize=20, fontweight='bold')
@@ -437,14 +452,28 @@ class IndexAnalyzer:
                         t, v = aggregate_data(d.time.values, d.values, time_resolution)
                         model_aggs[m] = pd.Series(v, index=pd.DatetimeIndex(t))
                     
-                    df_models = pd.DataFrame(model_aggs)
+                    df_models = pd.DataFrame(model_aggs).dropna()
+                    if df_models.empty: continue
+                    
                     mmm = df_models.mean(axis=1)
-                    std = df_models.std(axis=1)
+                    model_min = df_models.min(axis=1)
+                    model_max = df_models.max(axis=1)
                     common_t = mmm.index
                     
+                    # 计算相关系数图例
+                    corr_str = ''
+                    era5_series = pd.Series(era5_v, index=era5_t)
+                    common_era5_t = era5_series.index.intersection(common_t)
+                    if len(common_era5_t) > 2:
+                        try:
+                            corr, _ = pearsonr(era5_series.loc[common_era5_t], mmm.loc[common_era5_t])
+                            corr_str = f' [r={corr:.2f}]'
+                        except Exception:
+                            pass
+
                     ax.plot(common_t, mmm, color=color, linewidth=2, linestyle='-' if leadtime==0 else '--', 
-                            marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name})', zorder=5)
-                    ax.fill_between(common_t, mmm-std, mmm+std, color=color, alpha=0.2)
+                            marker='o' if leadtime==0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
+                    ax.fill_between(common_t, model_min, model_max, color=color, alpha=0.2, label=f'Spread ({name})', zorder=4)
 
             ax.tick_params(axis='both', labelsize=20)
             ax.set_ylabel('Nino3.4 Index (K)', fontsize=20, fontweight='bold')
@@ -482,12 +511,28 @@ class IndexAnalyzer:
             
             for leadtime, models, color, name in [(0, l0_models, 'red', 'L0'), (3, l3_models, 'blue', 'L3')]:
                 if models:
-                    df_m = pd.DataFrame({m: data_frames[m] for m in models})
+                    df_m = pd.DataFrame({m: data_frames[m] for m in models}).dropna()
+                    if df_m.empty: continue
+                    
                     mmm = df_m.mean(axis=1)
-                    std = df_m.std(axis=1)
+                    model_min = df_m.min(axis=1)
+                    model_max = df_m.max(axis=1)
+                    
+                    # 计算相关系数
+                    corr_str = ''
+                    if era5_s is not None and not era5_s.dropna().empty:
+                        era5_valid = era5_s.dropna()
+                        common_t = mmm.index.intersection(era5_valid.index)
+                        if len(common_t) > 2:
+                            try:
+                                corr, _ = pearsonr(era5_valid.loc[common_t], mmm.loc[common_t])
+                                corr_str = f' [r={corr:.2f}]'
+                            except Exception:
+                                pass
+
                     ax.plot(mmm.index, mmm.values, color=color, linewidth=2, linestyle='-' if leadtime == 0 else '--',
-                            marker='o' if leadtime == 0 else 's', markersize=4, label=f'MMM ({name})', zorder=5)
-                    ax.fill_between(mmm.index, mmm - std, mmm + std, color=color, alpha=0.2)
+                            marker='o' if leadtime == 0 else 's', markersize=4, label=f'MMM ({name}){corr_str}', zorder=5)
+                    ax.fill_between(mmm.index, model_min.values, model_max.values, color=color, alpha=0.2, label=f'Spread ({name})', zorder=4)
 
             ax.tick_params(axis='both', labelsize=20)
             ax.set_ylabel('EAWM Index (Standardized)', fontsize=20, fontweight='bold')
@@ -646,7 +691,6 @@ class IndexAnalyzer:
                         markeredgecolor='white', markeredgewidth=0.5)
             
 
-            # ax.set_xlabel('Lead Time (Months)', fontsize=14, fontweight='bold')
             ax.set_ylabel('Heidke Skill Score (HSS)', fontsize=14, fontweight='bold')
             
             ax.set_xticks(leadtimes)
